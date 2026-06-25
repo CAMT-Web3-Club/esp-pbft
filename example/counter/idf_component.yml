@@ -1,0 +1,4 @@
+dependencies:
+  phukrit7171/esp-pbft:
+    version: "*"
+    override_path: "../.."
