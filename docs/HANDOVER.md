@@ -3,7 +3,7 @@
 > **Project:** esp-pbft — lightweight PBFT consensus core library for ESP32-C3 clusters
 > **Version:** 1.0 (design complete, implementation pending)
 > **Date:** 2026-06-26
-> **Status:** 🟡 Design 100% — Implementation 0%
+> **Status:** 🟡 Design in progress — see [INDEX.md](./INDEX.md) for completion status
 > **Target hardware:** ESP32-C3 (RISC-V, 160 MHz, 400 KB SRAM, no PSRAM)
 > **ESP-IDF:** v6.0.1 (Mbed TLS 4.0.0 + TF-PSA-Crypto)
 
@@ -267,19 +267,22 @@ esp-pbft/
 └── README.md
 ```
 
-### 4.1 Implementation status (0%)
+### 4.1 Implementation status
 
-| Component | Design | Implementation | Tests |
-|-----------|--------|----------------|-------|
-| Types & config | ✅ 100% | ❌ 0% | ❌ 0% |
-| Crypto | ✅ 100% | ❌ 0% | ❌ 0% |
-| Network | ✅ 100% | ❌ 0% | ❌ 0% |
-| Membership | ✅ 100% | ❌ 0% | ❌ 0% |
-| Consensus | ✅ 100% | ❌ 0% | ❌ 0% |
-| View-Change | ✅ 100% | ❌ 0% | ❌ 0% |
-| Checkpoint | ✅ 100% | ❌ 0% | ❌ 0% |
-| Storage | ✅ 100% | ❌ 0% | ❌ 0% |
-| Logging | ✅ 100% | ❌ 0% | ❌ 0% |
+**Design overview:** high-level (covered in this file)
+**Detailed design:** see per-component docs (mostly TBD)
+
+| Component | High-level | Detailed | Implementation | Tests |
+|-----------|-----------|----------|----------------|-------|
+| Types & config | ✅ In HANDOVER | 🟡 TBD (API-REFERENCE) | ❌ 0% | ❌ 0% |
+| Crypto | ✅ In HANDOVER | 🟡 TBD (CRYPTO.md) | ❌ 0% | ❌ 0% |
+| Network | ✅ In HANDOVER | 🟡 TBD (PROTOCOL.md) | ❌ 0% | ❌ 0% |
+| Membership | ✅ In HANDOVER | 🟡 TBD (API-REFERENCE) | ❌ 0% | ❌ 0% |
+| Consensus | ✅ In HANDOVER | 🟡 TBD (CONSENSUS.md) | ❌ 0% | ❌ 0% |
+| View-Change | ✅ In HANDOVER | 🟡 TBD (VIEW-CHANGE.md) | ❌ 0% | ❌ 0% |
+| Checkpoint | ✅ In HANDOVER | 🟡 TBD (CHECKPOINT.md) | ❌ 0% | ❌ 0% |
+| Storage | ✅ In HANDOVER | 🟡 TBD (MEMORY.md) | ❌ 0% | ❌ 0% |
+| Logging | ✅ In HANDOVER | 🟡 TBD (API-REFERENCE) | ❌ 0% | ❌ 0% |
 
 ---
 
