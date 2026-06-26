@@ -1,4 +1,4 @@
-# PBFT Core — Handover Document
+# esp-pbft — Handover Document
 
 > **Project:** esp-pbft — lightweight PBFT consensus core library for ESP32-C3 clusters
 > **Version:** 1.0 (design complete, implementation pending)
@@ -54,7 +54,7 @@ Build a **memory-optimized PBFT (Practical Byzantine Fault Tolerance) consensus 
 ```
 Application  (user code: submit TX, register callback)
         ↓
-PBFT Core Public API  (pbft_init / start / submit / register_commit_cb)
+esp-pbft Public API  (pbft_init / start / submit / register_commit_cb)
         ↓
 ┌───────────────┬─────────────────┬───────────────┐
 │  Consensus    │  View-Change    │  Checkpoint   │
@@ -192,7 +192,7 @@ Runtime:
 
 ### 3.6 Why no blockchain?
 
-| Aspect | PBFT Core Only | + Blockchain |
+| Aspect | esp-pbft only | + Blockchain |
 |--------|---------------|--------------|
 | LOC | ~5,000 | ~20,000 |
 | Throughput | ~9K tx/sec | ~1K tx/sec |
@@ -200,7 +200,7 @@ Runtime:
 | Immutable history | ❌ | ✅ |
 | Smart contracts | ❌ | ✅ |
 
-PBFT Core is the consensus layer; the blockchain layer (if needed later) can be added without changing this design. **Migration path:** add `pbft_blockchain.c` that subscribes to commit callback.
+esp-pbft is the consensus layer; the blockchain layer (if needed later) can be added without changing this design. **Migration path:** add `esp-pbft-blockchain.c` that subscribes to commit callback.
 
 ### 3.7 Memory budget (verified for ESP32-C3, no PSRAM)
 
@@ -235,7 +235,7 @@ See [POWER.md](./POWER.md) for state-transition design.
 ## 4. File Structure (planned)
 
 ```
-pbft_core/
+esp-pbft/
 ├── include/
 │   ├── pbft.h                  ← public API
 │   ├── pbft_types.h            ← shared types, enums, structs
