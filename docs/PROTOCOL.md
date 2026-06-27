@@ -442,7 +442,7 @@ For every message except Hello-initial, MAC input = `view ‖ sequence ‖ msg_t
 | Prepare | 80 B | ✅ |
 | Commit | 80 B | ✅ |
 | View-Change | 88 B | ✅ |
-| New-View | ~500 B | ❌ exceeds |
+| New-View | ~2.5–6 KB (worst case) | ❌ exceeds |
 | Checkpoint | 80 B | ✅ |
 
 ### 8.1 Solutions for oversized messages
@@ -594,7 +594,7 @@ This is **not** the same as the public-key cache (TOFU) — see [CRYPTO.md §6](
 | Sequence | u64 | PBFT (large for long-lived) |
 | Min packet size | 76 B (Checkpoint) | this doc |
 | Max packet size (Pre-Prepare) | 82 + 256 = 338 B | exceeds ESP-NOW |
-| Max packet size (New-View) | ~500 B | exceeds ESP-NOW → must use UDP |
+| Max packet size (New-View) | ~2.5–6 KB (worst case, see §6.6) | exceeds ESP-NOW → must use UDP |
 
 ---
 

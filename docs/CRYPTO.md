@@ -243,6 +243,20 @@ void pbft_crypto_boot(void) {
 
 For Y-5 re-gen (§7), the same flow runs: each peer's imported key ID is destroyed before the new pubkey is imported.
 
+### 4.2 Why simple SHA-256 (not HKDF)?
+
+We use `SHA-256(shared || "PBFT-HMAC-v1")` instead of HKDF-Extract+Expand because:
+
+| Aspect | HKDF | Simple SHA-256 |
+|--------|------|----------------|
+| Output | 32+ B (expandable) | 32 B (fixed) |
+| Salt input | Required | Not needed (label "PBFT-HMAC-v1" replaces) |
+| Info input | Required | Yes ("PBFT-HMAC-v1") |
+| Code size | ~200 B | ~50 B |
+| Standard | RFC 5869 | Ad-hoc (acceptable for fixed-input pattern) |
+
+For our use case (single 32-byte HMAC key per peer, fixed inputs), simple SHA-256 is sufficient and simpler. **HKDF would be needed if we derived multiple sub-keys per peer** (e.g., one for encrypt, one for MAC) — not our case.
+
 ### 4.3 Boot quorum requirement (partial Hello handling)
 
 `pbft_discovery_wait(5000)` does not require **all** 6 peers to reply. We need enough to:
@@ -269,20 +283,6 @@ esp_err_t pbft_discovery_wait(uint32_t timeout_ms) {
 ```
 
 **Why 4?** Standard PBFT tolerates `f = 2` Byzantine nodes; need `2f + 1 = 5` for full safety. With **4 peers + self = 5**, we can run a degraded cluster (3+1 honest + 1 suspect) but if one of the 4 is Byzantine we are at risk. We accept 4 to handle transient boot ordering (one peer may be slow) and 1 stuck peer without blocking forever. **Below 4 = boot fails**; log critical and reset.
-
-### 4.2 Why simple SHA-256 (not HKDF)?
-
-We use `SHA-256(shared || "PBFT-HMAC-v1")` instead of HKDF-Extract+Expand because:
-
-| Aspect | HKDF | Simple SHA-256 |
-|--------|------|----------------|
-| Output | 32+ B (expandable) | 32 B (fixed) |
-| Salt input | Required | Not needed (label "PBFT-HMAC-v1" replaces) |
-| Info input | Required | Yes ("PBFT-HMAC-v1") |
-| Code size | ~200 B | ~50 B |
-| Standard | RFC 5869 | Ad-hoc (acceptable for fixed-input pattern) |
-
-For our use case (single 32-byte HMAC key per peer, fixed inputs), simple SHA-256 is sufficient and simpler. **HKDF would be needed if we derived multiple sub-keys per peer** (e.g., one for encrypt, one for MAC) — not our case.
 
 ---
 
