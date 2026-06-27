@@ -216,7 +216,13 @@ All PBFT messages start with a **4-byte common header**, followed by message-typ
 
 ### 4.2 Endianness
 
-All multi-byte fields are **little-endian** (ESP32-C3 is RISC-V, native LE).
+- **Host-integer multi-byte fields** (view, sequence, lengths, timestamps) are **little-endian** (ESP32-C3 is RISC-V, native LE; no byte-swap needed at runtime).
+- **Cryptographic fields** follow their standard canonical wire encoding per their respective specifications — they are NOT converted to host-endian:
+  - **ECDSA P-256 public key coordinates** are **big-endian** per SEC1 / ANSI X9.62 uncompressed point format (`0x04 ‖ X_BE(32) ‖ Y_BE(32)`, total 65 bytes). This matches the output of PSA's `psa_export_public_key()` for P-256 ([esp-idf master](https://github.com/espressif/esp-idf/blob/master/components/wpa_supplicant/esp_supplicant/src/crypto/crypto_mbedtls-ec.c)).
+  - **SHA-256 digests** are stored as raw byte arrays (no endianness concept — the bytes are the hash output).
+  - **HMAC tags** are stored as raw byte arrays (same).
+
+If a future wire field is added that uses a cryptographic format with mixed endianness (e.g., DSA signatures with r‖s where r,s may be DER-encoded), document the exception here with the source spec.
 
 ### 4.3 Alignment
 
