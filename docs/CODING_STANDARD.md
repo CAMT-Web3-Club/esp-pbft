@@ -494,6 +494,78 @@ remaining 20% is genuinely useful and free.
 | A19 | Hard-coded key material, IVs, or nonces | CERT MSC41-C, MISRA Dir 4.11 | esp-pbft signs consensus traffic — embedding a key means any leak of the ELF leaks the key. Use TF-PSA-Crypto's PSA ITS for key storage. |
 | A20 | Use of `<stdio.h>`, `<stdlib.h>` (malloc family), `<setjmp.h>`, `<tgmath.h>`, `<fenv.h>` | Zephyr Rule 123-130, MISRA Rule 21.x | These are banned in Zephyr kernel; esp-pbft has the same constraints. |
 
+### 3.1 Worked example: packed struct serialization (the right way)
+
+Anti-pattern A4 forbids casting `(uint8_t *)buf` to `(pbft_pre_prepare_t *)p` to "save a memcpy". The correct pattern uses **`__attribute__((packed))`** + explicit field-by-field `memcpy` via a small static helper:
+
+```c
+// PROTOCOL.md §6.2 — Pre-Prepare layout
+// 4 header | 4 view | 8 seq | 32 digest | 2 payload_len | N payload | 32 mac
+
+typedef struct __attribute__((packed)) {
+    uint32_t view;
+    uint64_t sequence;
+    uint8_t  digest[32];
+    uint16_t payload_len;
+    uint8_t  payload[PBFT_TX_PAYLOAD_MAX];   // variable length
+    uint8_t  mac[PBFT_MAC_BYTES];
+} pbft_pre_prepare_wire_t;
+
+// WRONG (banned by A4):
+//   pbft_pre_prepare_wire_t* p = (pbft_pre_prepare_wire_t*)rx_buf;
+//   printf("view=%u\n", p->view);   // UB: aliasing, unaligned access
+
+// RIGHT (the only allowed pattern):
+static inline uint32_t read_le32(const uint8_t* p) {
+    return  (uint32_t)p[0]
+         | ((uint32_t)p[1] << 8)
+         | ((uint32_t)p[2] << 16)
+         | ((uint32_t)p[3] << 24);
+}
+
+esp_err_t pbft_wire_decode_pre_prepare(const uint8_t* buf, size_t len,
+                                        pbft_pre_prepare_t* out) {
+    if (len < 4 + 4 + 8 + 32 + 2 + PBFT_MAC_BYTES) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    size_t off = 4;                       // skip common header
+    out->view        = read_le32(buf + off);  off += 4;
+    out->sequence    = read_le64(buf + off);  off += 8;
+    memcpy(out->digest, buf + off, 32);       off += 32;
+    out->payload_len = read_le16(buf + off);  off += 2;
+    if (out->payload_len > PBFT_TX_PAYLOAD_MAX) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    if (len < off + out->payload_len + PBFT_MAC_BYTES) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    memcpy(out->payload, buf + off, out->payload_len);  off += out->payload_len;
+    memcpy(out->mac, buf + off, PBFT_MAC_BYTES);
+    return ESP_OK;
+}
+```
+
+**Why this matters on RISC-V:**
+
+1. **Aliasing UB.** Casting `uint8_t*` to a packed struct pointer is a strict-aliasing violation. C23 `-fstrict-aliasing` (default at `-O2`) keeps the code, but GCC may reorder loads in ways that produce wrong crypto signatures.
+
+2. **Unaligned access.** RISC-V tolerates unaligned loads but at a performance penalty (and some ESP32-C3 errata list unaligned access as a potential source of bus faults). Explicit byte-by-byte reads are 100% portable.
+
+3. **Endianness portability.** `read_le32` works whether the host is little-endian (ESP32-C3) or big-endian. A direct cast assumes host order.
+
+**Helper functions (defined once in `pbft_wire.h`):**
+
+```c
+static inline uint16_t read_le16(const uint8_t* p);
+static inline uint32_t read_le32(const uint8_t* p);
+static inline uint64_t read_le64(const uint8_t* p);
+static inline void     write_le16(uint8_t* p, uint16_t v);
+static inline void     write_le32(uint8_t* p, uint32_t v);
+static inline void     write_le64(uint8_t* p, uint64_t v);
+```
+
+All are O(1), inlinable, and produce deterministic wire output regardless of host endianness.
+
 ---
 
 ## 4. Recommended compiler flags for esp-pbft

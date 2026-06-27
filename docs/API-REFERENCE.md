@@ -397,7 +397,7 @@ CONFIG_PBFT_TRANSPORT_ESP_NOW=y
 # CONFIG_PBFT_TRANSPORT_WIFI_UDP is not set
 
 # Wi-Fi UDP power-save mode (only effective when WIFI_UDP=y)
-# See POWER.md §11 for trade-offs.
+# See POWER.md §12 for trade-offs.
 CONFIG_PBFT_WIFI_PS_MIN_MODEM=y
 # CONFIG_PBFT_WIFI_PS_NONE=y       # debug only
 # CONFIG_PBFT_WIFI_PS_MAX_MODEM=y  # marginal extra savings

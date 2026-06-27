@@ -493,8 +493,8 @@ These are higher-level than the HANDOVER.md open questions:
 |----------------|------|-------|----------|
 | `pbft_config_t` (active config) | ~100 B | BSS | Permanent |
 | ECDSA private key (current boot) | 32 B | BSS | RAM, regenerated on Y-5 |
-| ECDSA public key (own) | 64 B | BSS | RAM, regenerated on Y-5 |
-| Peer pubkey cache (7 nodes) | 7 × 64 B = 448 B | BSS | Permanent (TOFU) |
+| ECDSA public key (own) | 65 B (0x04 ‖ X_BE ‖ Y_BE, uncompressed P-256) | BSS | RAM, regenerated on Y-5 |
+| Peer pubkey cache (7 nodes) | 7 × 65 B = 455 B | BSS | Permanent (TOFU) |
 | HMAC keys (6 peers × 32 B) | 192 B | BSS | RAM, regenerated on Y-5 |
 | Pending TX log (100 entries × ~120 B) | ~12 KB | BSS | Until checkpoint GC |
 | Prepare certificate cache (per-view) | ~2 KB | BSS | Per-view |

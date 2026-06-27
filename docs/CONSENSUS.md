@@ -64,28 +64,40 @@ typedef struct {
     uint8_t    state;                 // IDLE / PRE_PREPARED / PREPARED / COMMITTED / EXECUTED
     uint8_t    primary_id;            // who assigned this sequence
 
+    // Timeout tracking (set on each state transition)
+    uint64_t   state_entered_ms;      // esp_timer_get_time()/1000 when state was set
+                                      //   used by §6.2 to detect stale entries
+
     // Pre-Prepare cache
     uint8_t    have_pre_prepare;      // boolean
-    uint8_t*   payload;               // TX data, 0..PBFT_TX_PAYLOAD_MAX
+    uint8_t    payload[PBFT_TX_PAYLOAD_MAX];  // TX data, 0..256 bytes (inline)
     size_t     payload_len;
 
     // Prepare certificate (≥2f+1 matching Prepare messages)
     uint8_t    prepare_count;         // 0..7
-    uint8_t    prepare_from[7];       // bitmask of replicas who sent Prepare
+    uint8_t    prepare_from;          // bitmask (1<<node) of replicas who sent Prepare
 
     // Commit certificate (≥2f+1 matching Commit messages)
     uint8_t    commit_count;
-    uint8_t    commit_from[7];        // bitmask
+    uint8_t    commit_from;           // bitmask
 
     // App callback (fired at COMMITTED)
     pbft_commit_cb_t app_cb;          // NULL = no callback registered
 
     // Sequence number garbage collection
     uint8_t    gc_marked;             // true after stable checkpoint
+
+    // Anti-replay: have we sent our own Prepare/Commit already in this view?
+    uint8_t    own_prepare_sent;      // 1 after we broadcast Prepare
+    uint8_t    own_commit_sent;       // 1 after we broadcast Commit
 } pbft_log_entry_t;
 ```
 
-**Static array:** `pbft_log[PBFT_LOG_MAX_ENTRIES]` = `100 × ~120 B` = **~12 KB** in BSS (see [ARCHITECTURE.md §11](./ARCHITECTURE.md)).
+**Static array:** `pbft_log[PBFT_LOG_MAX_ENTRIES]` = `100 × ~360 B` = **~36 KB** in BSS (see [MEMORY.md §2.3](./MEMORY.md)).
+
+**Cross-view cleanup:** On view-change to view V, scan log and free any entries where `entry->view < V` and `entry->state < COMMITTED` (uncommitted). The bitmasks must be cleared and `own_*_sent` reset because the new view assigns fresh sequence numbers (see [VIEW-CHANGE.md §5.2](./VIEW-CHANGE.md)).
+
+**Anti-replay across views:** The MAC input binds `view‖sequence‖type‖digest‖payload` (see [CRYPTO.md §5.1](./CRYPTO.md)). A Prepare broadcast in view V cannot be replayed in view V+1 because the view field in the MAC input differs. The receiving replica recomputes MAC with the new view — the old MAC will not verify.
 
 ### 3.2 Per-view state
 
@@ -190,6 +202,7 @@ void pbft_handle_pre_prepare(const pbft_pre_prepare_t* pp, uint8_t sender) {
     entry->payload_len = pp->payload_len;
     memcpy(entry->payload, pp->payload, pp->payload_len);
     entry->state = PBFT_STATE_PRE_PREPARED;
+    entry->state_entered_ms = esp_timer_get_time() / 1000;
 
     // 6. Broadcast Prepare
     pbft_prepare_t prepare = {
@@ -200,8 +213,9 @@ void pbft_handle_pre_prepare(const pbft_pre_prepare_t* pp, uint8_t sender) {
     pbft_send_prepare(&prepare);
 
     // 7. Count own Prepare
-    entry->prepare_from[my_node_id] = 1;
-    entry->prepare_count = 1;
+    entry->prepare_from    = (uint8_t)(1u << my_node_id);
+    entry->prepare_count   = 1;
+    entry->own_prepare_sent = 1;
 }
 ```
 
@@ -220,8 +234,9 @@ void pbft_handle_prepare(const pbft_prepare_t* p, uint8_t sender) {
     }
 
     // 3. Count this Prepare
-    if (!entry->prepare_from[sender]) {
-        entry->prepare_from[sender] = 1;
+    uint8_t sender_bit = (uint8_t)(1u << sender);
+    if (!(entry->prepare_from & sender_bit)) {
+        entry->prepare_from |= sender_bit;
         entry->prepare_count++;
     }
 
@@ -229,6 +244,7 @@ void pbft_handle_prepare(const pbft_prepare_t* p, uint8_t sender) {
     if (entry->prepare_count >= 2 * PBFT_F + 1 &&  // 5 for f=2
         entry->state == PBFT_STATE_PRE_PREPARED) {
         entry->state = PBFT_STATE_PREPARED;
+        entry->state_entered_ms = esp_timer_get_time() / 1000;
 
         // Broadcast Commit
         pbft_commit_t commit = {
@@ -239,8 +255,9 @@ void pbft_handle_prepare(const pbft_prepare_t* p, uint8_t sender) {
         pbft_send_commit(&commit);
 
         // Count own Commit
-        entry->commit_from[my_node_id] = 1;
+        entry->commit_from = (uint8_t)(1u << my_node_id);
         entry->commit_count = 1;
+        entry->own_commit_sent = 1;
     }
 }
 ```
@@ -255,8 +272,9 @@ void pbft_handle_commit(const pbft_commit_t* c, uint8_t sender) {
     // Skip if not in PREPARED state
     if (entry->state != PBFT_STATE_PREPARED) {
         // Still count commit (may need it for later recovery)
-        if (!entry->commit_from[sender]) {
-            entry->commit_from[sender] = 1;
+        uint8_t sender_bit = (uint8_t)(1u << sender);
+        if (!(entry->commit_from & sender_bit)) {
+            entry->commit_from |= sender_bit;
             entry->commit_count++;
         }
         return;
@@ -269,14 +287,16 @@ void pbft_handle_commit(const pbft_commit_t* c, uint8_t sender) {
     }
 
     // Count commit
-    if (!entry->commit_from[sender]) {
-        entry->commit_from[sender] = 1;
+    uint8_t sender_bit = (uint8_t)(1u << sender);
+    if (!(entry->commit_from & sender_bit)) {
+        entry->commit_from |= sender_bit;
         entry->commit_count++;
     }
 
     // Quorum check
     if (entry->commit_count >= 2 * PBFT_F + 1) {
         entry->state = PBFT_STATE_COMMITTED;
+        entry->state_entered_ms = esp_timer_get_time() / 1000;
         view_state.last_committed_seq = MAX(
             view_state.last_committed_seq, entry->sequence);
 
@@ -383,7 +403,59 @@ void pbft_check_timeouts(void) {
 }
 ```
 
-### 6.3 Adaptive timeout (future enhancement)
+### 6.3 Retransmit policy (before view-change)
+
+Timeouts (§6.1) trigger view-change, but a transient packet loss should not cause view-change. We **retry** the local message **once** before declaring failure.
+
+| Phase | Local action on timeout | Retries before view-change |
+|-------|------------------------|----------------------------|
+| Pre-Prepare → Prepare | Re-broadcast Prepare | 1 retry after 500 ms; full view-change at 1000 ms |
+| Prepare → Commit | Re-broadcast Commit | 1 retry after 500 ms; full view-change at 1000 ms |
+| Commit → Execute | Re-fire app callback (no-op if already executed) | 1 retry after 500 ms |
+
+**Why not infinite retries?** Each round-trip is ~10 ms; 500 ms covers ~50 packet-loss retries which is enough for transient RF interference. Beyond that, the primary is likely faulty and view-change is the correct response.
+
+```c
+// Combined timeout + retransmit
+void pbft_check_timeouts(void) {
+    uint64_t now_ms = esp_timer_get_time() / 1000;
+
+    for (int i = 0; i < PBFT_LOG_MAX_ENTRIES; i++) {
+        pbft_log_entry_t* entry = &pbft_log[i];
+        if (entry->state == PBFT_STATE_FREE) continue;
+
+        uint64_t elapsed = now_ms - entry->state_entered_ms;
+
+        // First half of timeout: retry local broadcast
+        if (elapsed > view_state.prepare_timeout_ms / 2 &&
+            !entry->retry_sent) {
+            if (entry->state == PBFT_STATE_PRE_PREPARED) {
+                pbft_resend_prepare(entry);  // re-send our Prepare
+                entry->retry_sent = 1;
+                continue;
+            }
+            if (entry->state == PBFT_STATE_PREPARED) {
+                pbft_resend_commit(entry);   // re-send our Commit
+                entry->retry_sent = 1;
+                continue;
+            }
+        }
+
+        // Second half: full timeout → view-change
+        if (entry->state == PBFT_STATE_PRE_PREPARED &&
+            elapsed > view_state.prepare_timeout_ms) {
+            log_warn("Prepare timeout (no quorum) for seq %llu", entry->sequence);
+            pbft_initiate_view_change();
+            return;
+        }
+        // ... similar for PREPARED
+    }
+}
+```
+
+`retry_sent` is cleared on each state transition (so each phase gets its own retry budget).
+
+### 6.4 Adaptive timeout (future enhancement)
 
 Initial value: 1000 ms. **Adaptive per round:**
 - After every Prepare timeout: timeout *= 1.25 (capped at 5000 ms)
@@ -506,7 +578,36 @@ If log is full, primary must **stop assigning new sequences** until checkpoint a
 
 **End-to-end latency:** ~30-50 ms (in best case, no packet loss).
 
-**Throughput:** ~30 / sec = ~30 TPS per cluster (limited by 3-phase round-trips).
+### 9.1 Throughput model
+
+Three independent bottleneck dimensions:
+
+| Dimension | ESP-NOW (250 B cap) | Wi-Fi UDP (1500 B MTU) |
+|-----------|---------------------|------------------------|
+| **Round-trip count** | 3 (Pre-Prep / Prep / Commit) | 3 (Pre-Prep / Prep / Commit) |
+| **Per-TX broadcast cost** | 1 Pre-Prep + 1 Prep + 1 Commit = 3 packets × 7 receivers = 21 Tx | same shape, but TCP-friendly payload up to 1500 B |
+| **Latency floor (no contention)** | ~30 ms per round | ~30 ms per round |
+| **Max TPS (sequential, f=0 loss)** | ⌊1000/30⌋ = **33 TPS** | ⌊1000/30⌋ = **33 TPS** |
+| **Max TPS with 5% packet loss (1 retry)** | ⌊1000/45⌋ ≈ **22 TPS** | ⌊1000/45⌋ ≈ **22 TPS** |
+
+**Why TPS is the same on both transports:** PBFT's 3-phase round-trips dominate; transport bandwidth is irrelevant below 256 B TX. UDP only helps for **larger payloads** (where 250 B cap forces fragmentation) or **batching** (one Pre-Prepare carrying multiple TXs).
+
+### 9.2 Batching (Phase 2)
+
+If app can submit TXs in batches, primary can pack N TXs into one Pre-Prepare (up to `PBFT_TX_PAYLOAD_MAX = 256 B`, so N ≈ 3 TXs at 80 B each). New-View messages can carry longer O-set lists.
+
+With **per-view batching** of N=4 TXs (one Pre-Prepare carries 4 digests + payloads):
+
+| Phase | Per-TX latency | Cluster TPS |
+|-------|----------------|-------------|
+| No batching | 30 ms | 33 TPS |
+| Batched (N=4) | 30 ms / 4 = 7.5 ms | **133 TPS** |
+
+This requires changing the wire format to a "batch Pre-Prepare" (out of scope for v1; planned v2 — see [ROADMAP.md §3 P2](./ROADMAP.md)).
+
+### 9.3 Pipelining
+
+Not implemented in v1. With pipelining, the primary can assign sequence N+1 immediately after sending Pre-Prepare for N, without waiting for Commit. This pushes throughput toward the network-bound limit. **Decision:** Skip in v1; the 33 TPS single-TX baseline is sufficient for v1 use cases (sensor fusion, LED control).
 
 ---
 
@@ -566,10 +667,14 @@ The client submits TX to **current primary only**. If client submits to non-prim
 
 | Item | Size | Notes |
 |------|------|-------|
-| `pbft_log_entry_t` | ~120 B | payload (256 B max) + state + bitmasks |
+| `pbft_log_entry_t` | ~360 B | inline 256 B payload + state + bitmasks |
 | `PBFT_LOG_MAX_ENTRIES` | 100 | static array |
-| **Total PBFT log** | **~12 KB** | BSS, see ARCHITECTURE.md §11 |
-| `pbft_view_state_t` | ~80 B | per-view, single instance |
+| **Total PBFT log** | **~36 KB** | BSS, see [MEMORY.md §2.3](./MEMORY.md) |
+| `pbft_view_state_t` | ~120 B | per-view, single instance |
+| `pbft_dedup_entry_t` | 44 B | dedup cache, 64 entries |
+| **Total dedup cache** | **~2.8 KB** | BSS, see §15 |
+
+The inline-payload size is required by the no-heap design (see ARCHITECTURE.md §11). Earlier docs quoted "~120 B per entry" assuming pointer-to-payload; that figure is superseded.
 
 ---
 
@@ -584,14 +689,76 @@ The client submits TX to **current primary only**. If client submits to non-prim
 
 ---
 
-## 15. Open questions (consensus-level)
+## 15. Duplicate-request defense (TX_FLAG_DEDUP)
+
+### 15.1 Why needed
+
+If the app calls `pbft_submit(tx)` twice (e.g., due to retry after timeout), the same TX payload will be assigned two different sequences by the primary. Without dedup, both execute — wasting log slots and producing two callbacks.
+
+### 15.2 Mechanism
+
+Primary maintains a **TX dedup cache**: `digest → last_sequence` map, 64 entries, FIFO eviction.
+
+```c
+#define PBFT_DEDUP_SIZE  64   // BSS, ~2 KB
+
+typedef struct {
+    uint8_t  digest[32];
+    uint64_t seq;
+    uint32_t timestamp_ms;   // for FIFO eviction
+} pbft_dedup_entry_t;
+
+static pbft_dedup_entry_t s_dedup[PBFT_DEDUP_SIZE];
+
+esp_err_t pbft_dedup_check_and_insert(const uint8_t digest[32],
+                                       uint64_t new_seq,
+                                       uint32_t now_ms) {
+    // Lookup
+    for (int i = 0; i < PBFT_DEDUP_SIZE; i++) {
+        if (memcmp(s_dedup[i].digest, digest, 32) == 0) {
+            // Duplicate — return existing seq (caller can decide to drop or re-route)
+            return PBFT_ERR_DUPLICATE;  // carries s_dedup[i].seq via out-param
+        }
+    }
+    // Insert at oldest slot
+    int oldest = 0;
+    for (int i = 1; i < PBFT_DEDUP_SIZE; i++) {
+        if (s_dedup[i].timestamp_ms < s_dedup[oldest].timestamp_ms) oldest = i;
+    }
+    memcpy(s_dedup[oldest].digest, digest, 32);
+    s_dedup[oldest].seq = new_seq;
+    s_dedup[oldest].timestamp_ms = now_ms;
+    return ESP_OK;
+}
+```
+
+**Memory cost:** 64 × (32 + 8 + 4) = 64 × 44 B = **~2.8 KB** in BSS.
+
+### 15.3 Caller contract (see API-REFERENCE §4)
+
+App can opt in to dedup:
+
+```c
+pbft_submit_ex(tx, PBFT_TX_FLAG_DEDUP);   // dedup-aware
+pbft_submit(tx);                           // may produce duplicates
+```
+
+When dedup returns `PBFT_ERR_DUPLICATE`, app should **not retry** — the original TX is in-flight or committed. Returning the existing seq is informational (debug aid).
+
+### 15.4 Replicas do NOT dedup
+
+Only the **primary** runs the dedup check. Replicas accept any Pre-Prepare from the primary — that's PBFT's contract. If primary is Byzantine and replays a committed TX, replicas see `(view, seq)` as the ordering key, not the digest, so they're free to re-execute. The application's app callback should be **idempotent** for this reason (see [DEPLOYMENT.md §4](./DEPLOYMENT.md)).
+
+---
+
+## 16. Open questions (consensus-level)
 
 | # | Question | Status |
 |---|----------|--------|
-| C1 | Adaptive timeout vs fixed 1000 ms? | 🟡 Adaptive recommended, fixed for v1 |
-| C2 | How to handle duplicate submissions? (same digest, new seq) | 🟡 Reject duplicates within view |
+| C1 | Adaptive timeout vs fixed 1000 ms? | ✅ Fixed for v1; adaptive planned v2 (§6.4) |
+| C2 | How to handle duplicate submissions? (same digest, new seq) | ✅ Dedup cache, §15 |
 | C3 | Should primary broadcast Commit immediately after Prepare? | 🟡 TBD (optimisation) |
-| C4 | What if app_callback() blocks for long? | 🟡 v1: must be non-blocking |
+| C4 | What if app_callback() blocks for long? | ✅ v1: must be non-blocking (API-REFERENCE §5) |
 
 ---
 

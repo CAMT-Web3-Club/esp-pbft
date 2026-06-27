@@ -302,27 +302,27 @@ See [MEMORY.md](./MEMORY.md) for the detailed per-module layout, `static_assert`
 
 ### 3.8 Power budget (per transport)
 
-**ESP-NOW build (default):**
+**ESP-NOW build (default) — superseded by [POWER.md §4.4 workload model + §12.6 corrected budget]:**
 
 | Mode | Current | Time/Day | Energy/Day |
 |------|---------|----------|------------|
-| Active (consensus) | 80 mA | 1 h | 80 mAh |
-| Light sleep | 0.5 mA | 23 h | 11.5 mAh |
-| **Total** | — | — | **~92 mAh/day** |
+| Active (consensus) | see POWER.md §12.6 | derived (workload-model) | see POWER.md §12.6 |
+| Light sleep | 0.13 mA (130 µA datasheet typ) | per POWER.md §4.2 | derived |
+| **Total** | — | — | **~52 mAh/day** (PS_MIN_MODEM + light-sleep) |
 
-→ 1000 mAh battery → **~10 days battery life**
+→ 1000 mAh battery → **~19 days battery life**
 
-**Wi-Fi UDP build:**
+**Wi-Fi UDP build — superseded by [POWER.md §12.6]:**
 
 | Mode | Current | Time/Day | Energy/Day |
 |------|---------|----------|------------|
-| Active (consensus) | 160 mA | 1 h | 160 mAh |
-| Light sleep | 0.5 mA | 23 h | 11.5 mAh |
-| **Total** | — | — | **~172 mAh/day** |
+| Active (consensus) | see POWER.md §12.6 | derived (workload-model) | see POWER.md §12.6 |
+| Light sleep | 0.13 mA (130 µA datasheet typ) | per POWER.md §4.2 | derived |
+| **Total** | — | — | **~17 mAh/day** (PS_MIN_MODEM + light-sleep; UDP is more efficient than ESP-NOW because modem-sleep is enabled) |
 
-→ 1000 mAh battery → **~5.8 days battery life**
+→ 1000 mAh battery → **~58 days battery life**
 
-See [POWER.md](./POWER.md) for state-transition design and per-mode measurements.
+> **Note (post-Round-2 audit):** the older "1 h active / 0.5 mA light sleep / 80 mA ESP-NOW active / 160 mA UDP active" numbers in this §3.8 were placeholders without derivation. POWER.md §4 derives active time from throughput (14 TPS @ 1 ms airtime = ~50 s/day at 833 TPS-demand, not 1 h), and §12.6 re-budgets correctly. The corrected numbers above are from POWER.md §12.6 (PS_MIN_MODEM + light-sleep).
 
 ---
 

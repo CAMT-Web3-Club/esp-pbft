@@ -104,7 +104,7 @@ This is the master index for the esp-pbft design and implementation documentatio
 
 - ESP-NOW vs Wi-Fi UDP comparison → [PROTOCOL.md](./PROTOCOL.md) §3
 - ESP-NOW impl → [PROTOCOL.md](./PROTOCOL.md) §2.2
-- Wi-Fi UDP impl + power-save → [PROTOCOL.md](./PROTOCOL.md) §2.3 + [POWER.md](./POWER.md) §11
+- Wi-Fi UDP impl + power-save → [PROTOCOL.md](./PROTOCOL.md) §2.3 + [POWER.md](./POWER.md) §12
 - ESP-NOW 250 B size limit + UDP fallback → [PROTOCOL.md](./PROTOCOL.md) §8
 - Wire format / byte layout → [PROTOCOL.md](./PROTOCOL.md) §4-6
 - MAC binding (view+seq+type+digest+payload) → [CRYPTO.md](./CRYPTO.md) §5.1
@@ -210,7 +210,7 @@ This is the master index for the esp-pbft design and implementation documentatio
 | **V-set** | Set of VIEW-CHANGE messages proving a view-change | [VIEW-CHANGE.md §4.1](./VIEW-CHANGE.md) |
 | **View** | Configuration number; changes when primary rotates | [CONSENSUS.md §2](./CONSENSUS.md) |
 | **View-Change** | Protocol to rotate primary on suspected failure | [VIEW-CHANGE.md §1](./VIEW-CHANGE.md) |
-| **Wi-Fi PS modem** | Power-save mode that sleeps between beacons/DTIMs | [POWER.md §11](./POWER.md) |
+| **Wi-Fi PS modem** | Power-save mode that sleeps between beacons/DTIMs | [POWER.md §12](./POWER.md) |
 | **Y-5** | Pattern Y variant with periodic key re-gen (every 24 h) | [CRYPTO.md §7](./CRYPTO.md) |
 
 ---

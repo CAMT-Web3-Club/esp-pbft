@@ -109,7 +109,7 @@ static pbft_net_err_t wifi_udp_init(const pbft_net_config_t* cfg) {
     esp_wifi_set_config(/* SSID, channel, etc. */);
     esp_wifi_start();
 
-    // 2. Apply power-save mode per role (see POWER.md §11)
+    // 2. Apply power-save mode per role (see POWER.md §12)
     wifi_udp_set_role(cfg->my_node_id == 0);
 
     // 3. Create UDP socket
@@ -136,7 +136,7 @@ static pbft_net_err_t wifi_udp_init(const pbft_net_config_t* cfg) {
 
 **Size constraint:** UDP max payload = **65,507 bytes** (IP MTU 1500 in practice → ~1472 bytes).
 
-**Power-save modem mode (mandatory):** AP node → `WIFI_PS_NONE`; STA nodes → `WIFI_PS_MIN_MODEM`. Without this, Wi-Fi UDP build draws ~160 mA continuously; with `WIFI_PS_MIN_MODEM`, STA current drops to 30-60 mA. Full rationale, Kconfig, and edge cases in [POWER.md §11](./POWER.md#11-wi-fi-udp-power-save-modem-mode).
+**Power-save modem mode (mandatory):** AP node → `WIFI_PS_NONE`; STA nodes → `WIFI_PS_MIN_MODEM`. Without this, Wi-Fi UDP build draws ~160 mA continuously; with `WIFI_PS_MIN_MODEM` + DFS ON + DTIM 1 + 160 MHz, STA current drops to **11.35 mA average** (Espressif-measured, [wifi-performance-and-power-save.html](https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-guides/wifi-driver/wifi-performance-and-power-save.html)). Full rationale, Kconfig, and edge cases in [POWER.md §12](./POWER.md#12-wi-fi-udp-power-save-modem-mode).
 
 ### 2.5 UDP multicast vs unicast fan-out — AP multicast-cache limitation
 
@@ -229,9 +229,8 @@ All multi-byte fields are **little-endian** (ESP32-C3 is RISC-V, native LE).
 
 | Type ID | Name | Direction | Size (typical) | Defined in |
 |---------|------|-----------|----------------|------------|
-| 0 | `PBFT_MSG_HELLO` | bidirectional (bootstrap) | 4 + 68 + 32 = **104 B** | §6.1 |
+| 0 | `PBFT_MSG_HELLO` | bidirectional (bootstrap) | 4 + 1 + 65 + 32 = **102 B wire, 104 B with 2 B alignment pad** | §6.1 |
 | 1 | `PBFT_MSG_PRE_PREPARE` | primary → all | 4 + 4 + 8 + 32 + 2 + payload + 32 = **82 + payload B** | §6.2 |
-| 2 | `PBFT_MSG_PREPARE` | all → all | 4 + 4 + 8 + 32 + 32 = **80 B** | §6.3 |
 | 2 | `PBFT_MSG_PREPARE` | all → all | 4 + 4 + 8 + 32 + 32 = **80 B** | §6.3 |
 | 3 | `PBFT_MSG_COMMIT` | all → all | 4 + 4 + 8 + 32 + 32 = **80 B** | §6.4 |
 | 4 | `PBFT_MSG_VIEW_CHANGE` | all → all | 4 + 88 + n_prepared × 40 = **88–4088 B** | §6.5 + [VIEW-CHANGE.md §4.3](./VIEW-CHANGE.md) |
@@ -438,7 +437,7 @@ For every message except Hello-initial, MAC input = `view ‖ sequence ‖ msg_t
 
 | Message | Size | Fits in ESP-NOW? |
 |---------|------|------------------|
-| Hello | 103 B | ✅ |
+| Hello | 104 B (102 B wire + 2 B pad to align) | ✅ |
 | Pre-Prepare (256 B payload) | 338 B | ❌ exceeds |
 | Prepare | 80 B | ✅ |
 | Commit | 80 B | ✅ |
@@ -590,7 +589,7 @@ This is **not** the same as the public-key cache (TOFU) — see [CRYPTO.md §6](
 | UDP MTU | 1500 B | standard |
 | Common header | 4 B | this doc |
 | HMAC | 32 B | SHA-256 |
-| ECDSA pubkey (uncompressed) | 64 B | secp256r1 |
+| ECDSA pubkey (uncompressed) | 65 B | secp256r1 (PSA `psa_export_public_key` returns 0x04 ‖ X_BE(32) ‖ Y_BE(32)) |
 | View | u32 | PBFT |
 | Sequence | u64 | PBFT (large for long-lived) |
 | Min packet size | 76 B (Checkpoint) | this doc |

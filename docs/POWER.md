@@ -268,36 +268,34 @@ ESP-NOW can sleep the radio between RX windows. The window/interval pair control
 
 ```c
 // In pbft_network_espnow.c, after esp_now_init():
-#if CONFIG_PBFT_ESPNOW_POWER_SAVE
+// Uses canonical Espressif Kconfig names — match DEPLOYMENT.md §6.5 sdkconfig.defaults
+// and the official esp-idf/examples/wifi/espnow pattern.
+#if CONFIG_ESPNOW_ENABLE_POWER_SAVE
     // 50 ms window every 200 ms = 25% duty cycle (tunable via Kconfig)
-    esp_wifi_connectionless_module_set_wake_interval(CONFIG_PBFT_ESPNOW_WAKE_INTERVAL_MS);
-    esp_now_set_wake_window(CONFIG_PBFT_ESPNOW_WAKE_WINDOW_MS);
+    esp_wifi_connectionless_module_set_wake_interval(CONFIG_ESPNOW_WAKE_INTERVAL);
+    esp_now_set_wake_window(CONFIG_ESPNOW_WAKE_WINDOW);
 #endif
 ```
 
+> **Why canonical Espressif names, not custom `CONFIG_PBFT_*`:** The Espressif esp-idf
+> example (`examples/wifi/espnow/main/espnow_example_main.c`) uses these exact Kconfig
+> symbols. Re-naming them in esp-pbft creates a fork that diverges from upstream
+> reference code; CI cannot grep one canonical name; users reading the Espressif docs
+> must mentally translate. Define the canonical symbols in `sdkconfig.defaults`
+> (see [DEPLOYMENT.md §6.5](./DEPLOYMENT.md#65-esp-idf-power-save-kconfig-mandatory-for-esp-now-rx-duty-cycling)).
+
+**Reference: required `sdkconfig.defaults` entries (from DEPLOYMENT.md §6.5):**
+
 ```kconfig
-config PBFT_ESPNOW_POWER_SAVE
-    bool "Enable ESP-NOW RX duty-cycling"
-    default y
-    help
-      Enable esp_now_set_wake_window + esp_wifi_connectionless_module_set_wake_interval
-      for ESP-NOW RX power saving. Reduces ESP-NOW standby current from ~80 mA to
-      ~25 mA at the cost of slightly higher RX latency (window/interval tradeoff).
+# Master switch for ESP-NOW RX duty-cycling
+CONFIG_ESPNOW_ENABLE_POWER_SAVE=y
 
-config PBFT_ESPNOW_WAKE_WINDOW_MS
-    int "ESP-NOW wake window (ms)"
-    default 50
-    range 1 100
-    help
-      How long the radio stays awake per interval to receive ESP-NOW frames.
+# 25% duty cycle (50 ms window per 200 ms interval) — tunable
+CONFIG_ESPNOW_WAKE_WINDOW=50
+CONFIG_ESPNOW_WAKE_INTERVAL=200
 
-config PBFT_ESPNOW_WAKE_INTERVAL_MS
-    int "ESP-NOW wake interval (ms)"
-    default 200
-    range 50 1000
-    help
-      How often the radio wakes. Window/Interval ratio = duty cycle.
-      50/200 = 25% duty cycle (typical).
+# Required by esp_now_set_wake_window() in disconnected state
+CONFIG_ESP_WIFI_STA_DISCONNECTED_PM_ENABLE=y
 ```
 
 ---
@@ -478,4 +476,4 @@ Add to TEST-PLAN.md §3 (perf tests) so worst-case power is measured.
 
 ---
 
-**End of POWER.md (v0.2 draft — adds §11 Wi-Fi UDP power-save modem config; addresses audit issues C8, C13)**
+**End of POWER.md (v0.3 draft — renumbered: ESP-NOW PS §9, Brownout §10, Checklist §11, Wi-Fi UDP PS modem §12, Open Q §13, Refs §14; Kconfig names aligned to canonical Espressif symbols; addresses audit issues C8, C13)**
