@@ -13,7 +13,7 @@ esp-pbft implements the standard **3-phase Practical Byzantine Fault Tolerance**
 The state machine executes once per request, on every replica, with the same logical steps:
 
 ```
-   IDLE → PRE_PREPARED → PREPARED → COMMITTED → EXECUTED → GC
+   FREE → PRE_PREPARED → PREPARED → COMMITTED → EXECUTED → GC
 ```
 
 Primary is determined by `p = view mod n`. View-change rotates the primary when faulty behavior is detected.
@@ -56,48 +56,52 @@ view = 7 → primary = 0   (cycle)
 
 ### 3.1 Per-request entry (in PBFT log)
 
+This struct is the canonical `pbft_log_entry_t` (single source of truth: [MEMORY.md §2.3](./MEMORY.md)); CONSENSUS matches it exactly.
+
 ```c
+typedef enum {
+    PBFT_ENTRY_FREE = 0,
+    PBFT_ENTRY_PRE_PREPARED,
+    PBFT_ENTRY_PREPARED,
+    PBFT_ENTRY_COMMITTED,
+    PBFT_ENTRY_EXECUTED,
+} pbft_entry_state_t;
+
 typedef struct {
-    uint32_t   view;                  // assigned by primary
-    uint64_t   sequence;              // assigned by primary (monotonic)
-    uint8_t    digest[32];            // SHA-256 of TX payload
-    uint8_t    state;                 // IDLE / PRE_PREPARED / PREPARED / COMMITTED / EXECUTED
-    uint8_t    primary_id;            // who assigned this sequence
-
-    // Timeout tracking (set on each state transition)
-    uint64_t   state_entered_ms;      // esp_timer_get_time()/1000 when state was set
-                                      //   used by §6.2 to detect stale entries
-
-    // Pre-Prepare cache
-    uint8_t    have_pre_prepare;      // boolean
-    uint8_t    payload[PBFT_TX_PAYLOAD_MAX];  // TX data, 0..256 bytes (inline)
-    size_t     payload_len;
-
-    // Prepare certificate (≥2f+1 matching Prepare messages)
-    uint8_t    prepare_count;         // 0..7
-    uint8_t    prepare_from;          // bitmask (1<<node) of replicas who sent Prepare
-
-    // Commit certificate (≥2f+1 matching Commit messages)
-    uint8_t    commit_count;
-    uint8_t    commit_from;           // bitmask
-
-    // App callback (fired at COMMITTED)
-    pbft_commit_cb_t app_cb;          // NULL = no callback registered
-
-    // Sequence number garbage collection
-    uint8_t    gc_marked;             // true after stable checkpoint
-
-    // Anti-replay: have we sent our own Prepare/Commit already in this view?
-    uint8_t    own_prepare_sent;      // 1 after we broadcast Prepare
-    uint8_t    own_commit_sent;       // 1 after we broadcast Commit
-} pbft_log_entry_t;
+    uint64_t           sequence;            // assigned by primary
+    uint32_t           view;                // view it was pre-prepared in
+    uint8_t            digest[32];          // SHA-256 of request payload
+    uint8_t            msg_type;            // request type tag
+    uint16_t           payload_len;         // bytes used in payload[]
+    uint8_t            payload[256];        // inline request (PBFT_TX_PAYLOAD_MAX)
+    pbft_entry_state_t state;               // FREE/PRE_PREPARED/PREPARED/COMMITTED/EXECUTED
+    uint8_t            prepare_bitmask;     // bit i = replica i sent Prepare
+    uint8_t            commit_bitmask;      // bit i = replica i sent Commit
+    uint8_t            exec_bitmask;        // bit i = replica i confirmed Execute (checkpoint)
+    bool               have_pre_prepare;    // this entry has a stored Pre-Prepare
+    bool               own_prepare_sent;    // this node broadcast its Prepare
+    bool               own_commit_sent;     // this node broadcast its Commit
+    bool               is_checkpoint;       // sequence is a checkpoint boundary
+    uint8_t            retry_count;         // retransmits so far (<= PBFT_MAX_RETRIES)
+    uint64_t           state_entered_ms;    // timestamp of last state transition
+    uint64_t           commit_received_ms;  // timestamp first Commit observed
+} pbft_log_entry_t;   // ~360 B; static_assert(sizeof <= 384)
 ```
+
+**Quorum counts** come from `__builtin_popcount(entry->prepare_bitmask)` etc.; there are NO
+`prepare_count` / `commit_count` fields and NO `prepare_from[7]` / `commit_from[7]` arrays.
+The commit callback is registered ONCE globally (see [API-REFERENCE.md §5](./API-REFERENCE.md)) —
+there is no per-entry `app_cb`. The node-level state type `pbft_state_t` / `PBFT_STATE_*`
+([API-REFERENCE.md §7.1](./API-REFERENCE.md)) is DISTINCT from `pbft_entry_state_t` /
+`PBFT_ENTRY_*`; the empty entry state is `PBFT_ENTRY_FREE`.
 
 **Static array:** `pbft_log[PBFT_LOG_MAX_ENTRIES]` = `100 × ~360 B` = **~36 KB** in BSS (see [MEMORY.md §2.3](./MEMORY.md)).
 
-**Cross-view cleanup:** On view-change to view V, scan log and free any entries where `entry->view < V` and `entry->state < COMMITTED` (uncommitted). The bitmasks must be cleared and `own_*_sent` reset because the new view assigns fresh sequence numbers (see [VIEW-CHANGE.md §5.2](./VIEW-CHANGE.md)).
+**Cross-view cleanup:** On view-change to view V, scan log and free any entries where `entry->view < V` and `entry->state < PBFT_ENTRY_COMMITTED` (uncommitted). The `prepare_bitmask`/`commit_bitmask` must be cleared and `own_*_sent` reset because the new view assigns fresh sequence numbers (see [VIEW-CHANGE.md §5.2](./VIEW-CHANGE.md)).
 
 **Anti-replay across views:** The MAC input binds `view‖sequence‖type‖digest‖payload` (see [CRYPTO.md §5.1](./CRYPTO.md)). A Prepare broadcast in view V cannot be replayed in view V+1 because the view field in the MAC input differs. The receiving replica recomputes MAC with the new view — the old MAC will not verify.
+
+**Sequence numbering (A7):** Sequence numbers are view-global and monotonic across view-changes. The first Pre-Prepare in view v+1 carries sequence `low_watermark + 1`.
 
 ### 3.2 Per-view state
 
@@ -129,7 +133,7 @@ typedef struct {
                                        │
                                        ▼
                        ┌─────────────────────────────────────┐
-                       │  IDLE                              │
+                       │  PBFT_ENTRY_FREE                   │
                        │  (entry created in PBFT log)       │
                        └─────────────────┬───────────────────┘
                                          │
@@ -183,9 +187,11 @@ void pbft_handle_pre_prepare(const pbft_pre_prepare_t* pp, uint8_t sender) {
     }
 
     // 2. Verify HMAC (already done by transport layer)
-    // 3. Check sequence number is in valid range
-    if (pp->sequence < view_state.high_watermark ||
-        pp->sequence > view_state.high_watermark + PBFT_LOG_MAX_ENTRIES) {
+    // 3. Check sequence number is in valid range:
+    //    accept low_watermark < seq <= high_watermark
+    //    (high_watermark = low_watermark + PBFT_LOG_MAX_ENTRIES)
+    if (pp->sequence <= view_state.low_watermark ||
+        pp->sequence > view_state.high_watermark) {
         log_warn("Pre-Prepare seq %llu out of range", pp->sequence);
         return;
     }
@@ -201,7 +207,7 @@ void pbft_handle_pre_prepare(const pbft_pre_prepare_t* pp, uint8_t sender) {
     memcpy(entry->digest, pp->digest, 32);
     entry->payload_len = pp->payload_len;
     memcpy(entry->payload, pp->payload, pp->payload_len);
-    entry->state = PBFT_STATE_PRE_PREPARED;
+    entry->state = PBFT_ENTRY_PRE_PREPARED;
     entry->state_entered_ms = esp_timer_get_time() / 1000;
 
     // 6. Broadcast Prepare
@@ -212,10 +218,9 @@ void pbft_handle_pre_prepare(const pbft_pre_prepare_t* pp, uint8_t sender) {
     };
     pbft_send_prepare(&prepare);
 
-    // 7. Count own Prepare
-    entry->prepare_from    = (uint8_t)(1u << my_node_id);
-    entry->prepare_count   = 1;
-    entry->own_prepare_sent = 1;
+    // 7. Record own Prepare
+    entry->prepare_bitmask  = (uint8_t)(1u << my_node_id);
+    entry->own_prepare_sent = true;
 }
 ```
 
@@ -233,17 +238,13 @@ void pbft_handle_prepare(const pbft_prepare_t* p, uint8_t sender) {
         return;
     }
 
-    // 3. Count this Prepare
-    uint8_t sender_bit = (uint8_t)(1u << sender);
-    if (!(entry->prepare_from & sender_bit)) {
-        entry->prepare_from |= sender_bit;
-        entry->prepare_count++;
-    }
+    // 3. Record this Prepare
+    entry->prepare_bitmask |= (uint8_t)(1u << sender);
 
     // 4. Check if we have quorum
-    if (entry->prepare_count >= 2 * PBFT_F + 1 &&  // 5 for f=2
-        entry->state == PBFT_STATE_PRE_PREPARED) {
-        entry->state = PBFT_STATE_PREPARED;
+    if (__builtin_popcount(entry->prepare_bitmask) >= 2 * PBFT_F + 1 &&  // 5 for f=2
+        entry->state == PBFT_ENTRY_PRE_PREPARED) {
+        entry->state = PBFT_ENTRY_PREPARED;
         entry->state_entered_ms = esp_timer_get_time() / 1000;
 
         // Broadcast Commit
@@ -254,10 +255,9 @@ void pbft_handle_prepare(const pbft_prepare_t* p, uint8_t sender) {
         };
         pbft_send_commit(&commit);
 
-        // Count own Commit
-        entry->commit_from = (uint8_t)(1u << my_node_id);
-        entry->commit_count = 1;
-        entry->own_commit_sent = 1;
+        // Record own Commit
+        entry->commit_bitmask  = (uint8_t)(1u << my_node_id);
+        entry->own_commit_sent = true;
     }
 }
 ```
@@ -269,14 +269,15 @@ void pbft_handle_commit(const pbft_commit_t* c, uint8_t sender) {
     pbft_log_entry_t* entry = pbft_log_find(c->view, c->sequence);
     if (!entry) return;
 
+    // Record first Commit observation time
+    if (entry->commit_bitmask == 0) {
+        entry->commit_received_ms = esp_timer_get_time() / 1000;
+    }
+
     // Skip if not in PREPARED state
-    if (entry->state != PBFT_STATE_PREPARED) {
-        // Still count commit (may need it for later recovery)
-        uint8_t sender_bit = (uint8_t)(1u << sender);
-        if (!(entry->commit_from & sender_bit)) {
-            entry->commit_from |= sender_bit;
-            entry->commit_count++;
-        }
+    if (entry->state != PBFT_ENTRY_PREPARED) {
+        // Still record commit (may need it for later recovery)
+        entry->commit_bitmask |= (uint8_t)(1u << sender);
         return;
     }
 
@@ -286,31 +287,33 @@ void pbft_handle_commit(const pbft_commit_t* c, uint8_t sender) {
         return;
     }
 
-    // Count commit
-    uint8_t sender_bit = (uint8_t)(1u << sender);
-    if (!(entry->commit_from & sender_bit)) {
-        entry->commit_from |= sender_bit;
-        entry->commit_count++;
-    }
+    // Record commit
+    entry->commit_bitmask |= (uint8_t)(1u << sender);
 
     // Quorum check
-    if (entry->commit_count >= 2 * PBFT_F + 1) {
-        entry->state = PBFT_STATE_COMMITTED;
+    if (__builtin_popcount(entry->commit_bitmask) >= 2 * PBFT_F + 1) {
+        entry->state = PBFT_ENTRY_COMMITTED;
         entry->state_entered_ms = esp_timer_get_time() / 1000;
         view_state.last_committed_seq = MAX(
             view_state.last_committed_seq, entry->sequence);
 
-        // Fire app callback (in single-threaded mode, here is fine)
-        if (entry->app_cb) {
-            pbft_tx_t tx = {
-                .payload = entry->payload,
-                .payload_len = entry->payload_len,
-                .tx_id = entry->digest,
-            };
-            entry->app_cb(&tx, entry->sequence);
+        // Skip execution if this sequence was already executed (e.g. re-proposed
+        // across a view-change) — prevents double execution (G16).
+        if (entry->sequence > view_state.last_executed_seq) {
+            // Fire the globally-registered commit callback (API-REFERENCE §5).
+            pbft_commit_cb_t cb = pbft_get_commit_cb();   // single global callback
+            if (cb) {
+                pbft_tx_t tx = {
+                    .payload = entry->payload,
+                    .payload_len = entry->payload_len,
+                    .tx_id = entry->digest,
+                };
+                cb(&tx, entry->sequence);
+            }
+            view_state.last_executed_seq = entry->sequence;
         }
 
-        entry->state = PBFT_STATE_EXECUTED;
+        entry->state = PBFT_ENTRY_EXECUTED;
     }
 }
 ```
@@ -331,26 +334,28 @@ uint64_t pbft_primary_assign_sequence(void) {
 
 ### 5.2 Handle submit() (primary path)
 
+`pbft_submit` takes a NON-const `tx` and writes back `tx->digest` and `tx->sequence` as OUT fields (G17).
+
 ```c
-esp_err_t pbft_submit(const pbft_tx_t* tx) {
+esp_err_t pbft_submit(pbft_tx_t* tx) {
     if (my_node_id != view_state.primary_id) {
         // Non-primary: forward to primary (or reject — TBD)
         log_warn("Non-primary cannot submit directly");
         return PBFT_ERR_NOT_PRIMARY;
     }
 
-    // 1. Compute digest
-    uint8_t digest[32];
-    pbft_sha256(tx->payload, tx->payload_len, digest);
+    // 1. Compute digest (plain SHA-256 of the buffer, see CRYPTO.md / G18)
+    pbft_sha256(tx->payload, tx->payload_len, tx->digest);
 
     // 2. Assign sequence
     uint64_t seq = view_state.next_sequence++;
+    tx->sequence = seq;   // write back OUT field
 
     // 3. Build and broadcast Pre-Prepare
     pbft_pre_prepare_t pp = {
         .view = view_state.view,
         .sequence = seq,
-        .digest = digest,
+        .digest = tx->digest,
         .payload_len = tx->payload_len,
         .payload = tx->payload,  // borrowed pointer
         .primary_id = my_node_id,
@@ -388,11 +393,11 @@ void pbft_check_timeouts(void) {
 
     for (int i = 0; i < PBFT_LOG_MAX_ENTRIES; i++) {
         pbft_log_entry_t* entry = &pbft_log[i];
-        if (entry->state == PBFT_STATE_FREE) continue;
+        if (entry->state == PBFT_ENTRY_FREE) continue;
 
         uint64_t elapsed = now_ms - entry->state_entered_ms;
 
-        if (entry->state == PBFT_STATE_PRE_PREPARED &&
+        if (entry->state == PBFT_ENTRY_PRE_PREPARED &&
             elapsed > view_state.prepare_timeout_ms) {
             log_warn("Prepare timeout for seq %llu", entry->sequence);
             pbft_initiate_view_change();
@@ -405,15 +410,19 @@ void pbft_check_timeouts(void) {
 
 ### 6.3 Retransmit policy (before view-change)
 
-Timeouts (§6.1) trigger view-change, but a transient packet loss should not cause view-change. We **retry** the local message **once** before declaring failure.
+Timeouts (§6.1) trigger view-change, but a transient packet loss should not cause view-change. We **retry** the local message up to `PBFT_MAX_RETRIES = 3` times before declaring failure, tracked by the per-entry `retry_count` counter (G8).
+
+```c
+#define PBFT_MAX_RETRIES  3
+```
 
 | Phase | Local action on timeout | Retries before view-change |
 |-------|------------------------|----------------------------|
-| Pre-Prepare → Prepare | Re-broadcast Prepare | 1 retry after 500 ms; full view-change at 1000 ms |
-| Prepare → Commit | Re-broadcast Commit | 1 retry after 500 ms; full view-change at 1000 ms |
-| Commit → Execute | Re-fire app callback (no-op if already executed) | 1 retry after 500 ms |
+| Pre-Prepare → Prepare | Re-broadcast Prepare | up to 3 retries every `timeout_ms / 2`; full view-change at `timeout_ms` |
+| Prepare → Commit | Re-broadcast Commit | up to 3 retries every `timeout_ms / 2`; full view-change at `timeout_ms` |
+| Commit → Execute | Re-fire commit callback (no-op if already executed) | up to 3 retries every `timeout_ms / 2` |
 
-**Why not infinite retries?** Each round-trip is ~10 ms; 500 ms covers ~50 packet-loss retries which is enough for transient RF interference. Beyond that, the primary is likely faulty and view-change is the correct response.
+**Why not infinite retries?** Each round-trip is ~10 ms; `PBFT_MAX_RETRIES = 3` rebroadcasts cover transient RF interference. Beyond that, the primary is likely faulty and view-change is the correct response.
 
 ```c
 // Combined timeout + retransmit
@@ -422,27 +431,28 @@ void pbft_check_timeouts(void) {
 
     for (int i = 0; i < PBFT_LOG_MAX_ENTRIES; i++) {
         pbft_log_entry_t* entry = &pbft_log[i];
-        if (entry->state == PBFT_STATE_FREE) continue;
+        if (entry->state == PBFT_ENTRY_FREE) continue;
 
         uint64_t elapsed = now_ms - entry->state_entered_ms;
 
-        // First half of timeout: retry local broadcast
+        // Before full timeout: retry local broadcast up to PBFT_MAX_RETRIES,
+        // once per timeout_ms/2 window while quorum is missing.
         if (elapsed > view_state.prepare_timeout_ms / 2 &&
-            !entry->retry_sent) {
-            if (entry->state == PBFT_STATE_PRE_PREPARED) {
+            entry->retry_count < PBFT_MAX_RETRIES) {
+            if (entry->state == PBFT_ENTRY_PRE_PREPARED) {
                 pbft_resend_prepare(entry);  // re-send our Prepare
-                entry->retry_sent = 1;
+                entry->retry_count++;
                 continue;
             }
-            if (entry->state == PBFT_STATE_PREPARED) {
+            if (entry->state == PBFT_ENTRY_PREPARED) {
                 pbft_resend_commit(entry);   // re-send our Commit
-                entry->retry_sent = 1;
+                entry->retry_count++;
                 continue;
             }
         }
 
-        // Second half: full timeout → view-change
-        if (entry->state == PBFT_STATE_PRE_PREPARED &&
+        // Full timeout → view-change
+        if (entry->state == PBFT_ENTRY_PRE_PREPARED &&
             elapsed > view_state.prepare_timeout_ms) {
             log_warn("Prepare timeout (no quorum) for seq %llu", entry->sequence);
             pbft_initiate_view_change();
@@ -453,7 +463,7 @@ void pbft_check_timeouts(void) {
 }
 ```
 
-`retry_sent` is cleared on each state transition (so each phase gets its own retry budget).
+`retry_count` is cleared on each state transition (so each phase gets its own retry budget of `PBFT_MAX_RETRIES`).
 
 ### 6.4 Adaptive timeout (future enhancement)
 
@@ -477,9 +487,9 @@ This avoids flapping during transient network slowness but recovers quickly when
 
 ### 7.2 Counting strategy
 
-Each log entry has a **bitmask** (`prepare_from[7]` or `commit_from[7]`), one bit per node. Quorum check is `count_ones(bitmask) >= 5`.
+Each log entry has a single `uint8_t` **bitmask** (`prepare_bitmask` or `commit_bitmask`), one bit per node. Quorum check is `__builtin_popcount(bitmask) >= 5`.
 
-**Optimization:** Use `uint8_t` (1 byte fits 8 nodes) or `uint32_t` (32 bits for future expansion).
+**Layout:** a single `uint8_t` (1 byte) holds all 7 nodes' bits — no `[7]` arrays.
 
 ```c
 static inline uint8_t pbft_count_set_bits(uint8_t bm) {

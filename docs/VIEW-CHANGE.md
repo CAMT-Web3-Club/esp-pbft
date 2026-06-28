@@ -105,7 +105,7 @@ typedef struct {
 
     // V-set cache: VIEW-CHANGE messages received for the current view_change target
     uint8_t             vc_set_count;           // 0..n-1
-    uint8_t             vc_set_from[7];         // bitmask of senders
+    uint8_t             vc_set_from;            // single bitmask: bit i = VC received from node i (G19)
     const pbft_view_change_t* vc_set[7];        // pointers into RX message arena
 
     uint32_t            prepare_timeout_ms;     // default 1000
@@ -192,9 +192,9 @@ The MAC input is `view ‖ new_view ‖ checkpoint_seq ‖ checkpoint_digest ‖
 - 5 VC proofs (≥ 2f+1) = 2440 B
 - New-View outer = 4 + 4 + 1 + 3 + 32 + 2440 + 32 = 2516 B
 - + O-set: typically 0-10 Pre-Prepares × 338 B = 0-3380 B
-- **Grand total worst case ≈ 5900 B** → **UDP only.**
+- **Grand total worst case ≈ 5.9 KB** → **UDP only.**
 
-This is documented in PROTOCOL.md §8.2: New-View always uses UDP regardless of default transport.
+This is documented in PROTOCOL.md §8.2: because the New-View message exceeds the ESP-NOW 250 B frame, view-change as a feature **requires the build `CONFIG_PBFT_TRANSPORT_WIFI_UDP=y`** and is sent over the single compiled-in `default_transport` (G11). There is no runtime fallback and no separate UDP transport; under `CONFIG_PBFT_TRANSPORT_ESP_NOW=y` view-change is not supported (PROTOCOL §8.1).
 
 ---
 
@@ -220,8 +220,8 @@ void pbft_handle_view_change(const pbft_view_change_t* vc, uint8_t sender) {
     // 2. If I am the new primary, store the VC for V-set
     uint8_t new_primary = (uint8_t)((view_state.view + 1) % PBFT_CLUSTER_SIZE);
     if (new_primary == my_node_id) {
-        if (!view_state.vc_set_from[sender]) {
-            view_state.vc_set_from[sender] = 1;
+        if (!(view_state.vc_set_from & (1u << sender))) {
+            view_state.vc_set_from |= (1u << sender);
             view_state.vc_set_count++;
             // Copy VC into arena slot
             memcpy(&vc_set_arena[sender], vc, pbft_vc_size(vc));
@@ -238,8 +238,8 @@ void pbft_handle_view_change(const pbft_view_change_t* vc, uint8_t sender) {
     }
 
     // 3. Replica side: record VC toward quorum
-    if (!view_state.vc_set_from[sender]) {
-        view_state.vc_set_from[sender] = 1;
+    if (!(view_state.vc_set_from & (1u << sender))) {
+        view_state.vc_set_from |= (1u << sender);
         view_state.vc_set_count++;
         memcpy(&vc_set_arena[sender], vc, pbft_vc_size(vc));
         view_state.vc_set[sender] = &vc_set_arena[sender];
@@ -316,8 +316,10 @@ void pbft_send_view_change(uint32_t new_view) {
 
 ```c
 void pbft_handle_new_view(const pbft_new_view_t* nv, uint8_t sender) {
-    // 1. Validate sender is the new primary
-    uint8_t expected_primary = (uint8_t)(view_state.view % PBFT_CLUSTER_SIZE);
+    // 1. Validate sender is the new primary.
+    //    The view has NOT advanced yet at validation time, so the new primary
+    //    is (view + 1) % n, not view % n (G15 off-by-one fix).
+    uint8_t expected_primary = (uint8_t)((view_state.view + 1) % PBFT_CLUSTER_SIZE);
     if (sender != expected_primary) {
         log_warn("New-View from non-primary %d (expected %d)",
                  sender, expected_primary);
@@ -337,18 +339,18 @@ void pbft_handle_new_view(const pbft_new_view_t* nv, uint8_t sender) {
     }
 
     // 4. For each embedded VC, verify its MAC and that its sender is in the set
-    uint8_t distinct_senders[7] = {0};
+    uint8_t distinct_senders = 0;   // single bitmask: bit i = VC from node i (G19)
     for (int i = 0; i < nv->num_vc; i++) {
         const pbft_view_change_t* vc = pbft_nv_get_vc(nv, i);
         if (vc->new_view != nv->view) { log_warn("VC new_view mismatch"); return; }
         if (vc->sender_id >= PBFT_CLUSTER_SIZE) return;
-        if (distinct_senders[vc->sender_id]) { log_warn("Duplicate VC sender"); return; }
-        distinct_senders[vc->sender_id] = 1;
+        if (distinct_senders & (1u << vc->sender_id)) { log_warn("Duplicate VC sender"); return; }
+        distinct_senders |= (1u << vc->sender_id);
         if (pbft_verify_vc_mac(vc, vc->sender_id) != ESP_OK) {
             log_warn("Embedded VC MAC invalid"); return;
         }
     }
-    if (pbft_count_set_bits_from_array(distinct_senders) < PBFT_QUORUM) {
+    if (pbft_count_set_bits(distinct_senders) < PBFT_QUORUM) {
         log_warn("New-View V-set lacks quorum of distinct senders");
         return;
     }
@@ -364,6 +366,13 @@ void pbft_handle_new_view(const pbft_new_view_t* nv, uint8_t sender) {
     // 6. Compute O-set locally (must match what new primary computed)
     pbft_pre_prepare_t o_set[PBFT_LOG_MAX_ENTRIES];
     uint8_t n_o = pbft_compute_o_set(nv, o_set);   // deterministic, see §6
+    if (n_o == PBFT_O_SET_NEEDS_CATCHUP) {
+        // Too far behind to replay the O-set in place (G15 overflow guard).
+        // pbft_compute_o_set already issued a state-transfer request; abort the
+        // New-View apply and retry verification once caught up.
+        log_warn("New-View: node behind O-set span — catching up via state-transfer");
+        return;
+    }
     // Compare with embedded Pre-Prepares
     if (n_o != nv->n_pre_prepares) {
         log_warn("O-set length mismatch (local=%d, sent=%d)", n_o, nv->n_pre_prepares);
@@ -388,7 +397,7 @@ void pbft_handle_new_view(const pbft_new_view_t* nv, uint8_t sender) {
     view_state.primary_id = expected_primary;
     view_state.phase = PBFT_VIEW_PHASE_NORMAL;
     view_state.vc_set_count = 0;
-    memset(view_state.vc_set_from, 0, sizeof(view_state.vc_set_from));
+    view_state.vc_set_from = 0;
 
     // 8. For each O-set Pre-Prepare, run it through the normal Pre-Prepare handler
     for (int i = 0; i < n_o; i++) {
@@ -403,7 +412,7 @@ void pbft_handle_new_view(const pbft_new_view_t* nv, uint8_t sender) {
 
 ### 6.1 O-set construction (the core of view-change)
 
-The new primary computes a deterministic O-set from the union of the prepared-sets in the V-set. PBFT §4.4 gives the algorithm. Adapted for esp-pbft:
+The new primary computes a deterministic O-set from the union of the prepared-sets in the V-set. PBFT §4.4 gives the algorithm. Adapted for esp-pbft. On success the function returns the O-set length (`0..PBFT_LOG_MAX_ENTRIES`); the reserved sentinel `PBFT_O_SET_NEEDS_CATCHUP` (`0xFF`) signals that this node is too far behind and must state-transfer first (G15):
 
 ```c
 uint8_t pbft_compute_o_set(const pbft_new_view_t* nv,
@@ -445,17 +454,38 @@ uint8_t pbft_compute_o_set(const pbft_new_view_t* nv,
         if (vc->checkpoint_seq > lw_max) lw_max = vc->checkpoint_seq;
     }
 
+    // Step 2b: compute the O-set UPPER BOUND deterministically from the V-set
+    //   (G15). The bound is max_prepared_seq = the maximum sequence appearing in
+    //   ANY prepared-set across the V-set — identical on every node. It MUST NOT
+    //   be view_state.next_sequence (a node-local counter that differs per node
+    //   and would make the O-set non-deterministic, breaking verification).
+    uint64_t max_prepared_seq = lw_max;   // floor: nothing below the checkpoint
+    for (int k = 0; k < n_cand; k++) {
+        if (candidates[k].seq > max_prepared_seq) max_prepared_seq = candidates[k].seq;
+    }
+
+    // Step 2c: overflow guard (G15). The o_set[] array (and the local log) hold at
+    //   most PBFT_LOG_MAX_ENTRIES entries. If the span from the checkpoint to the
+    //   highest prepared sequence exceeds that capacity, this node is too far
+    //   behind to replay the O-set in place: the New-View is invalid for it and it
+    //   MUST catch up via state-transfer (CHECKPOINT.md §8) first, then re-validate.
+    //   Never silently overflow o_set[PBFT_LOG_MAX_ENTRIES].
+    if (max_prepared_seq - lw_max > PBFT_LOG_MAX_ENTRIES) {
+        log_warn("O-set span %llu exceeds log capacity %d — catch up via "
+                 "state-transfer before applying New-View",
+                 max_prepared_seq - lw_max, PBFT_LOG_MAX_ENTRIES);
+        pbft_request_state_transfer(lw_max + 1);   // CHECKPOINT.md §8
+        return PBFT_O_SET_NEEDS_CATCHUP;            // caller aborts New-View apply
+    }
+
     // Step 3: for each candidate, decide:
     //   - seq > lw_max AND n_votes >= f+1 (≥3): re-propose with this digest
     //     (≥ f+1 honest replicas prepared it, so the digest is canonical)
     //   - seq <= lw_max: drop (already in a stable checkpoint)
     //   - n_votes < f+1 OR no agreement on digest: assign a no-op (NULL digest)
     uint8_t n_o = 0;
-    uint64_t min_seq = (lw_max > PBFT_LOG_MAX_ENTRIES)
-                        ? lw_max - PBFT_LOG_MAX_ENTRIES
-                        : 0;
     for (uint64_t seq = lw_max + 1;
-         seq <= view_state.next_sequence;
+         seq <= max_prepared_seq;
          seq++) {
         // Find candidate for this seq
         prepared_with_count_t* c = NULL;
@@ -528,8 +558,17 @@ void pbft_send_new_view(void) {
     //    These are full Pre-Prepare messages (each ~80 + payload B)
     //    They go in the SAME UDP packet or in a continuation if too big.
 
-    // 6. Send via UDP (always)
-    udp_transport.broadcast(nv_buf, total_size);
+    // 6. Send via the single compiled-in transport (G11). View-change is only
+    //    supported when built with CONFIG_PBFT_TRANSPORT_WIFI_UDP=y, because the
+    //    New-View message (~5.9 KB worst case) far exceeds the ESP-NOW 250 B frame.
+    //    There is NO runtime fallback and NO separate udp_transport: the build
+    //    that enables view-change already has default_transport == the UDP transport.
+    //    Under CONFIG_PBFT_TRANSPORT_ESP_NOW=y view-change is not compiled in
+    //    (see PROTOCOL §8.1), so this path is unreachable in that build.
+#if !defined(CONFIG_PBFT_TRANSPORT_WIFI_UDP)
+#error "View-change requires CONFIG_PBFT_TRANSPORT_WIFI_UDP=y (New-View exceeds ESP-NOW frame)"
+#endif
+    default_transport->broadcast(nv_buf, total_size);
 }
 ```
 
@@ -626,9 +665,9 @@ New primary crashes mid-view-change. The `viewchange_timeout_ms` fires on all re
 | View-Change wire (typical) | 88 + n_prepared × 40 B | n_prepared ≈ 0-10 → 88-488 B |
 | View-Change wire (worst) | 4088 B | n_prepared = 100 |
 | New-View wire (typical) | 2500-5000 B | UDP only |
-| New-View wire (worst) | ~6000 B | UDP only |
+| New-View wire (worst) | ~5.9 KB | UDP only |
 
-**Conclusion:** View-Change fits ESP-NOW in typical cases (≤ 250 B); New-View always uses UDP.
+**Conclusion:** View-Change fits ESP-NOW in typical cases (≤ 250 B); New-View (~5.9 KB worst case) requires a `CONFIG_PBFT_TRANSPORT_WIFI_UDP=y` build and is sent via `default_transport` (G11).
 
 ---
 

@@ -494,18 +494,25 @@ These are higher-level than the HANDOVER.md open questions:
 | `pbft_config_t` (active config) | ~100 B | BSS | Permanent |
 | ECDSA private key (current boot) | 32 B | BSS | RAM, regenerated on Y-5 |
 | ECDSA public key (own) | 65 B (0x04 ‖ X_BE ‖ Y_BE, uncompressed P-256) | BSS | RAM, regenerated on Y-5 |
-| Peer pubkey cache (7 nodes) | 7 × 65 B = 455 B | BSS | Permanent (TOFU) |
-| HMAC keys (6 peers × 32 B) | 192 B | BSS | RAM, regenerated on Y-5 |
-| Pending TX log (100 entries × ~120 B) | ~12 KB | BSS | Until checkpoint GC |
-| Prepare certificate cache (per-view) | ~2 KB | BSS | Per-view |
-| Commit certificate cache (per-view) | ~2 KB | BSS | Per-view |
-| View-change state | ~1 KB | BSS | Per-view |
-| Checkpoint state | ~500 B | BSS | Permanent |
+| Peer pubkey cache (7 slots × 65 B) | 7 × 65 B = 455 B | BSS | Permanent (TOFU) |
+| HMAC keys (7 slots × 32 B) | 7 × 32 B = 224 B | BSS | RAM, regenerated on Y-5 |
+| Pending TX / PBFT log (100 entries × ~360 B) | ~36 KB | BSS | Until checkpoint GC |
+| V-set arena (7 × 488 B) | ~3.4 KB | BSS | Per-view |
+| Checkpoint proof table | ~640 B | BSS | Permanent |
+| Dedup / executed-digest cache (256 × 40 B) | ~10 KB | BSS | Permanent (FIFO) |
 | Network TX buffer | 4 KB | BSS | Permanent |
 | Network RX buffer | 4 KB | BSS | Permanent |
+| RX arena (parse, 2 concurrent) | 8 KB | BSS | Permanent |
+| TX queue (ISR submit) | ~4.5 KB | BSS | Permanent |
 | PSA crypto contexts (ECDSA, ECDH, HMAC) | ~3 KB | BSS | Permanent |
 | Metrics counters | ~200 B | BSS | Permanent |
-| **Total static** | **~30 KB** | **BSS** | — |
+| **Total static (esp-pbft source)** | **~72 KB** | **BSS** | — |
+
+> Arrays are sized `[7]` to the cluster size (self slot included/unused); 6 peers are
+> actually used. **Grand total ~117 KB** (lwIP excluded) including the ESP-IDF /
+> FreeRTOS / PSA library footprint — see [MEMORY.md](./MEMORY.md) §3 for the full
+> breakdown. esp-pbft source contains **zero `malloc`**; PSA crypto and FreeRTOS
+> allocate internally (§11.5).
 
 ### 11.3 Compile-time bounds checking
 

@@ -43,7 +43,7 @@ esp-pbft uses **light-sleep** as the primary power-saving mode. Deep-sleep break
               ▼
    ┌──────────────────────────────────────┐
    │  LIGHT_SLEEP                         │  ← CPU paused; Wi-Fi RX active
-   │  0.5 mA                              │
+   │  0.13 mA (130 µA floor)             │
    └──────────┬───────────────────────────┘
               │ incoming packet (WIFI_PKT wake)
               ▼
@@ -148,7 +148,8 @@ For a TX traveling through all 3 phases (each is one broadcast):
 For 14 TPS sustained:
 - Total airtime = 14 × 7 ms = 98 ms/s = 9.8% duty cycle
 - Active current: 80 mA
-- Average current: 0.098 × 80 + 0.902 × 0.5 = 7.84 + 0.45 = **8.3 mA average**
+- Light-sleep floor: 0.13 mA (130 µA, per §1/§3)
+- Average current: 0.098 × 80 + 0.902 × 0.13 = 7.84 + 0.12 = **7.96 mA average**
 
 ### 4.4 Energy per day
 
@@ -156,27 +157,29 @@ For 14 TPS sustained (24 hours):
 - 14 TPS × 86400 s = 1,209,600 TXs/day
 - Airtime: 1,209,600 × 7 ms = 8,467 s = 2.35 hours of airtime per day
 - Active energy: 2.35 h × 80 mA = 188 mAh
-- Light-sleep energy: 21.65 h × 0.5 mA = 10.8 mAh
-- **Total: 199 mAh/day**
+- Light-sleep energy: 21.65 h × 0.13 mA = 2.8 mAh
+- **Total: 191 mAh/day**
 
-→ 1000 mAh battery → **~5 days** battery life at 14 TPS sustained.
+Cross-check via average current: 7.96 mA × 24 h = 191 mAh/day ✓ (matches §4.3).
+
+→ 1000 mAh battery → 1000 / 191 ≈ **~5 days** battery life at 14 TPS sustained.
 
 ### 4.5 For lighter workload
 
 For 1 TPS sustained:
 - Airtime: 1 × 7 × 86400 ms = 604.8 s = 0.17 h/day
 - Active: 0.17 × 80 = 13.4 mAh
-- Light-sleep: 23.83 × 0.5 = 11.9 mAh
-- **Total: ~25 mAh/day**
+- Light-sleep: 23.83 h × 0.13 mA = 3.1 mAh
+- **Total: ~16.5 mAh/day**
 
-→ 1000 mAh → **~40 days** at 1 TPS.
+→ 1000 mAh → 1000 / 16.5 ≈ **~60 days** at 1 TPS.
 
 ### 4.6 Comparison to HANDOVER §3.8 claim
 
 | Workload | HANDOVER claim | Actual calculation | Δ |
 |----------|----------------|---------------------|---|
-| 14 TPS (steady-state max) | 92 mAh/day | 199 mAh/day | +117% |
-| 1 TPS | (not given) | 25 mAh/day | — |
+| 14 TPS (steady-state max) | 92 mAh/day | 191 mAh/day | +108% |
+| 1 TPS | (not given) | 16.5 mAh/day | — |
 
 HANDOVER's "92 mAh/day = 10 days on 1000 mAh" assumed an unjustified 1 h active/day (≈ 4 TPS). For the actual max-throughput workload, expect ~5 days.
 
@@ -419,13 +422,20 @@ Call `wifi_udp_set_role(my_node_id == 0)` at boot (node 0 is default AP), and ag
 
 ### 12.6 Power re-budget (corrected HANDOVER §3.8 with proper PS mode)
 
-| Mode | Old HANDOVER | Corrected (PS mode applied, ESP32-C3 measured) |
-|------|--------------|------------------------------|
-| ESP-NOW build, 14 TPS sustained (no light-sleep) | 92 mAh/day (unjustified) | 199 mAh/day (POWER.md §4.4) |
-| ESP-NOW build, 14 TPS sustained (light-sleep) | — | ~7.96 mAh/day (8.3 mA avg) |
-| Wi-Fi UDP build, 14 TPS sustained (no PS) | 172 mAh/day | (actual: ~280 mAh/day) |
-| Wi-Fi UDP build, 14 TPS sustained (PS_MIN_MODEM, no light-sleep) | — | **~52 mAh/day** (18.08 mA avg = 9.8% active 80mA + 90.2% modem-sleep 11.35mA) |
-| Wi-Fi UDP build, 14 TPS sustained (PS_MIN_MODEM + light-sleep) | — | **~17 mAh/day** (9.8% active 80mA + 90.2% light-sleep 0.13mA) |
+All rows assume the same 14 TPS workload: 9.8% active duty cycle at 80 mA, balance at the
+stated idle floor. mAh/day = avg current × 24 h. The only variable across rows is the
+**idle floor** (always-on 160 mA → modem-sleep 11.35 mA → light-sleep 0.13 mA).
+
+| Mode | Old HANDOVER | Avg current (9.8% × 80 mA + 90.2% × idle) | Corrected mAh/day |
+|------|--------------|-------------------------------------------|-------------------|
+| ESP-NOW build, 14 TPS, no light-sleep (idle = modem-sleep 11.35 mA) | 92 mAh/day (unjustified) | 0.098×80 + 0.902×11.35 = **18.08 mA** | ~434 mAh/day |
+| ESP-NOW build, 14 TPS, light-sleep (idle = 0.13 mA) | — | 0.098×80 + 0.902×0.13 = **7.96 mA** | **~191 mAh/day** (= §4.4) |
+| Wi-Fi UDP build, 14 TPS, no PS (idle = always-on 160 mA) | 172 mAh/day | 0.098×80 + 0.902×160 = **152 mA** | ~3650 mAh/day |
+| Wi-Fi UDP build, 14 TPS, PS_MIN_MODEM, no light-sleep (idle = 11.35 mA) | — | 0.098×80 + 0.902×11.35 = **18.08 mA** | ~434 mAh/day |
+| Wi-Fi UDP build, 14 TPS, PS_MIN_MODEM + light-sleep (idle = 0.13 mA) | — | 0.098×80 + 0.902×0.13 = **7.96 mA** | **~191 mAh/day** |
+
+On a 1000 mAh battery the best-case (light-sleep idle) ESP-NOW and Wi-Fi UDP builds both give
+1000 / 191 ≈ **~5 days** at 14 TPS sustained — consistent with §4.4.
 
 The HANDOVER §3.8 number of 172 mAh/day assumed modem-sleep was already active — it was not. With PS mode applied, the Wi-Fi UDP build is comparable to the ESP-NOW build in power.
 

@@ -21,7 +21,7 @@ This document is the **canonical reference for failure handling in esp-pbft**. I
 | Delay packets arbitrarily | ✅ assumed | network congestion, adversarial delay |
 | Control up to `f=2` cluster nodes | ✅ assumed (Byzantine model) | nodes may behave arbitrarily |
 | Compromise TRNG | ❌ NOT assumed | ESP32-C3 TRNG is NIST SP 800-22 compliant |
-| Extract RAM via physical access | ❌ NOT assumed (out of scope) | physical security required |
+| Extract RAM via physical access | 🟡 partially mitigated | Y-5 bounds the window to 24 h, JTAG disabled; not fully defended (see §5.6, DEPLOYMENT/TOFU §3.1) |
 | MITM during boot before any Hello | ❌ NOT assumed | TOFU model — first Hello wins (see §3.1) |
 | Compromise ESP-IDF Wi-Fi driver | ❌ NOT assumed | trust the SDK |
 | Side-channel (power, EM) on HMAC | ❌ NOT assumed | PSA hardware mitigations |
@@ -311,15 +311,22 @@ Each scenario is rated for: detectability, automatic mitigation, residual risk.
 
 ### 3.4 Retransmit policy
 
-PBFT-level retransmit (audit B8):
+PBFT-level retransmit (audit B8). One budget everywhere: `PBFT_MAX_RETRIES = 3`, tracked by
+the per-entry `retry_count` counter (NOT a one-shot flag). A phase rebroadcasts when it has
+not reached quorum within `timeout_ms / 2` **and** `retry_count < PBFT_MAX_RETRIES`; each
+rebroadcast does `retry_count++`. Quorum is `__builtin_popcount(entry->prepare_bitmask)` /
+`commit_bitmask` ≥ `2f+1` (there are no `prepare_count` / `commit_count` fields).
 
 | Message | Retransmit trigger | Max retries |
 |---------|--------------------|-------------|
-| Prepare | local entry in PRE_PREPARED for `> prepare_timeout_ms / 2` and prepare_count < quorum | 3 |
-| Commit | local entry in PREPARED for `> commit_timeout_ms / 2` and commit_count < quorum | 3 |
-| Checkpoint | local has not received quorum for `> checkpoint_timeout_ms / 2` | 3 |
-| View-Change | no New-View received within `viewchange_timeout_ms / 2` | 3 |
-| New-View | (new primary) no replica has sent any Prepare for `> viewchange_timeout_ms / 2` | 3 |
+| Prepare | local entry in PRE_PREPARED for `> prepare_timeout_ms / 2`, quorum not reached, and `retry_count < PBFT_MAX_RETRIES` | `PBFT_MAX_RETRIES = 3` |
+| Commit | local entry in PREPARED for `> commit_timeout_ms / 2`, quorum not reached, and `retry_count < PBFT_MAX_RETRIES` | `PBFT_MAX_RETRIES = 3` |
+| Checkpoint | local has not received quorum for `> checkpoint_timeout_ms / 2` and `retry_count < PBFT_MAX_RETRIES` | `PBFT_MAX_RETRIES = 3` |
+| View-Change | no New-View received within `viewchange_timeout_ms / 2` and `retry_count < PBFT_MAX_RETRIES` | `PBFT_MAX_RETRIES = 3` |
+| New-View | (new primary) no replica has sent any Prepare for `> viewchange_timeout_ms / 2` and `retry_count < PBFT_MAX_RETRIES` | `PBFT_MAX_RETRIES = 3` |
+
+After `retry_count` reaches `PBFT_MAX_RETRIES` without quorum, the entry's timeout escalates
+to a view-change (Prepare/Commit) rather than rebroadcasting indefinitely.
 
 Jitter: ± 10% random to avoid synchronised retransmit storms.
 
@@ -403,12 +410,17 @@ Jitter: ± 10% random to avoid synchronised retransmit storms.
 
 **Current pseudocode:** immediate destroy.
 
-**Mitigation:**
-- Keep old HMAC keys for grace period (`PBFT_Y5_GRACE_MS = 5000`)
-- During grace period, accept both old and new MAC keys for incoming messages
-- Send messages with new keys only
+**Mitigation (G9, option b — keep old keys; no consensus pause):**
+- On re-gen: derive the new keys, then **KEEP** the old `hmac_keys[]` for the grace window
+  (`PBFT_Y5_GRACE_MS = 5000`, 5 s). Do **not** `psa_destroy_key()` the old key immediately.
+- During the grace window, accept a MAC verified under **either** the old or the new key.
+- Send messages with the new key only.
+- Schedule destruction of the old key after `PBFT_Y5_GRACE_MS`; the grace timer (not the
+  re-gen step) is what calls `psa_destroy_key()`.
+- Consensus is **NOT** paused — messages continue to be produced and verified throughout the
+  grace window.
 
-**Decision:** add grace period in v1.
+**Decision:** add 5 s keep-old-keys grace period in v1. See CRYPTO §7.2/§7.3.
 
 ### 5.3 PSA key attribute misconfiguration (audit B4)
 

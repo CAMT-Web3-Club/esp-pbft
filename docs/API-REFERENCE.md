@@ -123,6 +123,8 @@ typedef enum {
 
 `esp_err_t` values returned to the app are guaranteed to be in the range `[PBFT_OK, PBFT_NET_ERR_NO_ROUTE]`; `PBFT_ERR_INTERNAL` and below are never returned (logged instead).
 
+> **Note — transport-status enum is separate.** The `PBFT_NET_ERR_*` codes above (`-50..-53`) belong to `pbft_err_t`. The transport layer uses a **distinct** enum, `pbft_transport_status_t`, defined in [PROTOCOL.md §2.1](./PROTOCOL.md) with values `PBFT_TX_OK = 0`, `PBFT_TX_TIMEOUT = -1`, `PBFT_TX_INVALID = -2`, `PBFT_TX_FULL = -3`. The transport layer **maps** `pbft_transport_status_t` into `pbft_err_t` (e.g. `PBFT_TX_TIMEOUT` → `PBFT_NET_ERR_TIMEOUT`). The two enums are not the same symbols and must not be confused.
+
 ---
 
 ## 4. Transaction submission
@@ -147,13 +149,19 @@ typedef struct {
 ### 4.2 `pbft_submit`
 
 ```c
-esp_err_t pbft_submit(pbft_tx_t* tx);
+esp_err_t pbft_submit(pbft_tx_t* tx);   // NON-const: tx->digest and tx->sequence are written back
 ```
+
+`tx` is **non-const** because `pbft_submit` writes back two OUT fields on success:
+
+- `tx->digest[32]` — the SHA-256 of the request payload (computed via `pbft_sha256(...)`, see CRYPTO.md).
+- `tx->sequence` — the sequence number assigned by the primary. If the digest was already in the dedup cache (§15.4), this is the **existing** sequence rather than a newly assigned one.
 
 | Aspect | Contract |
 |--------|----------|
 | **Preconditions** | `pbft_started` is true; `tx != NULL`; `tx->payload != NULL || tx->payload_len == 0`; `tx->payload_len <= PBFT_TX_PAYLOAD_MAX`. |
 | **Caller must be primary** | If `my_node_id != view_state.primary_id`, returns `PBFT_ERR_NOT_PRIMARY`. App is responsible for tracking the current primary via `pbft_get_view()` / `pbft_get_state()`. |
+| **OUT fields (written on success)** | `tx->digest` (SHA-256 of payload) and `tx->sequence` (assigned/existing sequence). Undefined on error. |
 | **Side effects** | Computes digest (fills `tx->digest`); assigns sequence (fills `tx->sequence`); broadcasts Pre-Prepare. |
 | **Return value** | `ESP_OK` when Pre-Prepare was successfully enqueued for transmission. **Not** when the cluster commits — that is asynchronous and signaled via the commit callback. |
 | **Errors** | `PBFT_ERR_NOT_PRIMARY`, `PBFT_ERR_LOG_FULL`, `PBFT_ERR_INVALID_ARG`. |
@@ -295,6 +303,22 @@ uint64_t     pbft_get_stable_checkpoint(void);
 | `pbft_get_stable_checkpoint` | Highest stable checkpoint sequence. |
 
 All getters are **thread-safe** (atomic reads from BSS; called from any task).
+
+### 7.2 Per-entry state vs. node state — two DISTINCT enums
+
+`pbft_state_t` (above, prefix `PBFT_STATE_*`) is the **node-level** state machine returned by `pbft_get_state()`. It is **not** the same as the **per-log-entry** state used internally by the consensus log. Each log entry carries a `pbft_entry_state_t` (prefix `PBFT_ENTRY_*`), defined in MEMORY.md §2.3 / CONSENSUS.md §3.1:
+
+```c
+typedef enum {
+    PBFT_ENTRY_FREE = 0,        // empty slot (NOT "IDLE")
+    PBFT_ENTRY_PRE_PREPARED,
+    PBFT_ENTRY_PREPARED,
+    PBFT_ENTRY_COMMITTED,
+    PBFT_ENTRY_EXECUTED,
+} pbft_entry_state_t;
+```
+
+The `PBFT_STATE_*` prefix must never be reused for log-entry states, and `pbft_entry_state_t` is internal (not part of the public app API). See [MEMORY.md §2.3](./MEMORY.md) for the canonical `pbft_log_entry_t` that embeds this field.
 
 ---
 
@@ -566,12 +590,38 @@ Called by the transport rx callback. Extracts `msg_type` from the header, dispat
 
 ```c
 // pbft_dedup.h
+#define PBFT_DEDUP_CACHE_SIZE 256   // entries; entry = {digest[32], sequence:u64} = 40 B; ~10 KB; FIFO eviction
+
 esp_err_t pbft_dedup_check_and_insert(const uint8_t digest[32],
-                                       uint64_t new_seq,
+                                       uint64_t* new_seq,
                                        uint32_t now_ms);
 ```
 
-Returns `PBFT_ERR_DUPLICATE` if digest already in cache; the existing sequence is returned via the `new_seq` out-parameter (caller can re-use or drop).
+The dedup / executed-digest cache holds `PBFT_DEDUP_CACHE_SIZE = 256` entries (each `{digest[32], sequence:u64}` = 40 B, ~10 KB total, FIFO eviction). It is present on **EVERY node** — not primary-only:
+
+- **Primary** (on `pbft_submit`): if the TX digest is already cached, the call returns the **existing** sequence (collapses duplicate submissions) instead of assigning a new one.
+- **Replica** (on Pre-Prepare): if the Pre-Prepare's digest is cached with a sequence `<= high_watermark` (i.e. already committed/executed), the replica logs an alarm and **rejects** the Pre-Prepare (Byzantine-primary replay defense).
+
+`pbft_dedup_check_and_insert` returns `PBFT_ERR_DUPLICATE` if the digest is already in the cache; the existing sequence is returned via the `new_seq` out-parameter (caller can re-use or reject). New-View carries executed digests so a fresh primary pre-populates this cache.
+
+### 15.5 Misc internal helpers
+
+```c
+// pbft_view_change.h — fetch the stored View-Change message for a view from NVS
+const pbft_view_change_t* pbft_nv_get_vc(uint32_t view);
+
+// pbft_checkpoint.h — find a stable-checkpoint proof for a given sequence (NULL if none)
+const pbft_checkpoint_proof_t* pbft_checkpoint_proof_find(uint64_t sequence);
+
+// pbft_util.h — single-byte popcount over one quorum bitmask (prepare/commit/exec)
+uint8_t pbft_count_set_bits(uint8_t bitmask);
+```
+
+| Function | Purpose | Used by |
+|----------|---------|---------|
+| `pbft_nv_get_vc` | Retrieve the persisted View-Change record for `view`. | VIEW-CHANGE.md §6 |
+| `pbft_checkpoint_proof_find` | Locate a stable-checkpoint proof covering `sequence`; returns NULL if none. | CHECKPOINT.md §7 |
+| `pbft_count_set_bits` | Popcount over a **single-byte** quorum bitmask (`prepare_bitmask` / `commit_bitmask` / `exec_bitmask`). Replaces the removed array-form `pbft_count_set_bits_from_array`. | CONSENSUS.md / VIEW-CHANGE.md quorum checks |
 
 ---
 

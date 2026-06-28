@@ -13,7 +13,7 @@ Severity legend: 🔴 protocol-breaking · 🟠 behavior-changing · 🟡 docume
 ### 🔴 A1. View-Change wire format omits the prepared-set
 **File:** PROTOCOL.md §6.5
 **Problem:** View-Change carries `(view, new_view, checkpoint_seq, checkpoint_digest, mac)` only. Standard PBFT requires each replica to include the **prepared set** — the list of `(seq, digest)` pairs for every TX the replica has in PREPARED or COMMITTED state above the checkpoint. Without it, the new primary cannot construct a defensible O-set (Pre-Prepares to re-propose), and replicas cannot verify the new-view.
-**Fix:** add `n_prepared : uint8` + `n_prepared × {seq:u64, digest:32}` to the View-Change body. With PBFT_LOG_MAX_ENTRIES=100 and worst case `2f+1=5` VCs in a New-View, total size grows but still ≤ 4 KB — fits UDP, exceeds ESP-NOW (split into multiple ESP-NOW frames or force UDP for New-View, which is already the plan).
+**Fix:** add `n_prepared : uint8` + `n_prepared × {seq:u64, digest:32}` to the View-Change body. With PBFT_LOG_MAX_ENTRIES=100 and worst case `2f+1=5` VCs in a New-View, total size grows but still ≤ 4 KB (superseded R2: ~5.9 KB worst case) — fits UDP, exceeds ESP-NOW (split into multiple ESP-NOW frames or force UDP for New-View, which is already the plan).
 
 ### 🔴 A2. New-View format conflates V-set proof with O-set delivery
 **File:** PROTOCOL.md §6.6
@@ -32,8 +32,8 @@ Severity legend: 🔴 protocol-breaking · 🟠 behavior-changing · 🟡 docume
 
 ### 🔴 A5. Memory budget contradiction across docs
 **Files:** HANDOVER §3.7 line "PBFT log 100 × 60 B = ~6 KB"; ARCHITECTURE §11 "100 × ~120 B = ~12 KB"; CONSENSUS §13 "~120 B per entry".
-**Problem:** the per-entry size depends on whether the 256-byte payload is stored inline (≈ 280 B/entry) or via a pointer (≈ 96 B/entry but payload memory comes from elsewhere). Neither figure matches the "60 B" claim in HANDOVER. The HANDOVER total "40 KB" therefore doesn't reconcile.
-**Fix:** define `pbft_log_entry_t` with **inline** payload (one struct = ~280 B, 100 entries = ~28 KB) since the design rules out heap. Update HANDOVER §3.7, ARCHITECTURE §11, CONSENSUS §13 to match. Then the static total is ~55 KB for ESP-NOW build (still within 400 KB SRAM but tighter than originally advertised). MEMORY.md to provide full layout with `static_assert` catalog.
+**Problem:** the per-entry size depends on whether the 256-byte payload is stored inline (≈ 280 B/entry) (superseded R2: ~360 B/entry) or via a pointer (≈ 96 B/entry but payload memory comes from elsewhere). Neither figure matches the "60 B" claim in HANDOVER. The HANDOVER total "40 KB" therefore doesn't reconcile.
+**Fix:** define `pbft_log_entry_t` with **inline** payload (one struct = ~280 B (superseded R2: ~360 B), 100 entries = ~28 KB (superseded R2: ~36 KB)) since the design rules out heap. Update HANDOVER §3.7, ARCHITECTURE §11, CONSENSUS §13 to match. Then the static total is ~55 KB for ESP-NOW build (superseded R2: ~72 KB esp-pbft / ~117 KB grand) (still within 400 KB SRAM but tighter than originally advertised). MEMORY.md to provide full layout with `static_assert` catalog.
 
 ### 🔴 A6. No high-watermark advancement → primary can stall after log fills
 **File:** CONSENSUS.md §8.4
@@ -82,7 +82,7 @@ Severity legend: 🔴 protocol-breaking · 🟠 behavior-changing · 🟡 docume
 ### 🟠 B7. New-View size forces UDP even in ESP-NOW-only deployment
 **File:** PROTOCOL.md §8.2
 **Problem:** "esp-pbft uses Wi-Fi UDP for New-View even when ESP-NOW is the default transport" — implies UDP must be initialized at boot (≈ +30 KB RAM) even for ESP-NOW-only deployments. This contradicts the "low memory" pitch.
-**Fix:** alternatives — (a) accept the +30 KB cost (still fits within 400 KB; budget becomes 70 KB total), (b) design a fragmentation scheme for New-View (2-3 ESP-NOW frames), (c) reduce VC proof count by using a single combined VC-receipt per replica. Recommend (a) for v1 with a documented cost.
+**Fix:** alternatives — (a) accept the +30 KB cost (still fits within 400 KB; budget becomes 70 KB total) (superseded R2: ~72 KB esp-pbft / ~117 KB grand), (b) design a fragmentation scheme for New-View (2-3 ESP-NOW frames), (c) reduce VC proof count by using a single combined VC-receipt per replica. Recommend (a) for v1 with a documented cost.
 
 ### 🟠 B8. No retransmit / resend logic for lost Prepare/Commit
 **File:** CONSENSUS.md §6

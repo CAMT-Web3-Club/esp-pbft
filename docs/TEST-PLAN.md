@@ -38,9 +38,9 @@ Location: `test/` directory in the esp-pbft repo.
 | `pbft_consensus` | `test_consensus.c` | 50 | state machine transitions, quorum math, log full, gap detection |
 | `pbft_viewchange` | `test_viewchange.c` | 30 | triggers, V-set/O-set, New-View verification, partition mode |
 | `pbft_checkpoint` | `test_checkpoint.c` | 20 | watermark advance, GC, digest mismatch, state transfer |
-| `pbft_network` | `test_network.c` | 15 | packet size limits, sender_id extraction |
+| `pbft_network` | `test_network.c` | 18 | packet size limits, sender_id extraction, wire byte-order round-trip, wire-version mismatch reject |
 | `pbft_log` | `test_log.c` | 10 | FIFO eviction, ring buffer wraparound |
-| **Total** | — | **~170 tests** | — |
+| **Total** | — | **~173 tests** | — |
 
 ### 2.2 Example: HMAC round-trip
 
@@ -82,7 +82,76 @@ TEST_CASE("quorum math: 5 of 7 = quorum", "[consensus]") {
 }
 ```
 
-### 2.4 CI gate
+### 2.4 Example: wire byte-order (endianness) round-trip
+
+Verifies the wire format is little-endian on the bus (DESIGN-AUDIT C1). Serialize a
+Pre-Prepare, then inspect the raw bytes of every multi-byte field at its known offset and
+assert little-endian layout, independent of host endianness. Also confirms a clean
+deserialize round-trip.
+
+```c
+TEST_CASE("wire byte-order: multi-byte fields are little-endian", "[network]") {
+    pbft_pre_prepare_t pp = {
+        .hdr = { .msg_type = PBFT_MSG_PRE_PREPARE, .sender_id = 0,
+                 .proto_version = PBFT_WIRE_VERSION, .reserved = 0 },
+        .view = 0x11223344u,
+        .sequence = 0x0102030405060708ull,
+    };
+    for (int i = 0; i < 32; i++) pp.digest[i] = (uint8_t)i;
+
+    uint8_t buf[PBFT_MAX_PACKET];
+    size_t n = pbft_serialize_pre_prepare(&pp, buf, sizeof(buf));
+    TEST_ASSERT_GREATER_THAN(0, n);
+
+    // view (u32 LE) at its offset: low byte first
+    const uint8_t *v = buf + PBFT_OFF_VIEW;
+    TEST_ASSERT_EQUAL_HEX8(0x44, v[0]);
+    TEST_ASSERT_EQUAL_HEX8(0x33, v[1]);
+    TEST_ASSERT_EQUAL_HEX8(0x22, v[2]);
+    TEST_ASSERT_EQUAL_HEX8(0x11, v[3]);
+
+    // sequence (u64 LE) at its offset: low byte first
+    const uint8_t *s = buf + PBFT_OFF_SEQUENCE;
+    TEST_ASSERT_EQUAL_HEX8(0x08, s[0]);
+    TEST_ASSERT_EQUAL_HEX8(0x07, s[1]);
+    TEST_ASSERT_EQUAL_HEX8(0x06, s[2]);
+    TEST_ASSERT_EQUAL_HEX8(0x05, s[3]);
+    TEST_ASSERT_EQUAL_HEX8(0x04, s[4]);
+    TEST_ASSERT_EQUAL_HEX8(0x03, s[5]);
+    TEST_ASSERT_EQUAL_HEX8(0x02, s[6]);
+    TEST_ASSERT_EQUAL_HEX8(0x01, s[7]);
+
+    // round-trip back to host order
+    pbft_pre_prepare_t out;
+    TEST_ASSERT_EQUAL(ESP_OK, pbft_deserialize_pre_prepare(buf, n, &out));
+    TEST_ASSERT_EQUAL_UINT32(pp.view, out.view);
+    TEST_ASSERT_EQUAL_UINT64(pp.sequence, out.sequence);
+    TEST_ASSERT_EQUAL_MEMORY(pp.digest, out.digest, 32);
+}
+```
+
+### 2.5 Example: wire-version mismatch rejected
+
+Freezes the v1 wire format (G3 / PROTOCOL §4.1): any packet whose `proto_version` differs
+from `PBFT_WIRE_VERSION` is rejected and counted as a dropped/invalid packet.
+
+```c
+TEST_CASE("wire-version mismatch is rejected", "[network]") {
+    uint8_t buf[PBFT_MAX_PACKET];
+    pbft_pre_prepare_t pp = make_valid_pre_prepare();   // proto_version = PBFT_WIRE_VERSION
+    size_t n = pbft_serialize_pre_prepare(&pp, buf, sizeof(buf));
+
+    // corrupt the proto_version byte in the common header
+    buf[PBFT_OFF_PROTO_VERSION] = PBFT_WIRE_VERSION + 1;
+
+    uint32_t dropped_before = s_metrics.invalid_packets;
+    pbft_pre_prepare_t out;
+    TEST_ASSERT_NOT_EQUAL(ESP_OK, pbft_deserialize_pre_prepare(buf, n, &out));
+    TEST_ASSERT_EQUAL_UINT32(dropped_before + 1, s_metrics.invalid_packets);
+}
+```
+
+### 2.6 CI gate
 
 ```
 ./tools/run_unit_tests.sh
@@ -119,6 +188,11 @@ A full PBFT instance runs on x86 Linux using a mocked ESP-IDF layer. Peers commu
 | H8 | 24h simulated time (Y-5 fires 7 times) | all 7 nodes remain operational; no key material leaked |
 | H9 | 100K TXs at max throughput | throughput stable; heap_min_free_bytes ≥ 16 KB throughout |
 | H10 | Replay old Prepare | rejected (anti-replay via view+seq) |
+| H11 | Submit duplicate TX (same payload) to primary | primary returns the **same** sequence both times (dedup cache hit, G6/B10); only one commit at every replica |
+| H12 | Byzantine primary replays a committed digest in a new Pre-Prepare | every honest replica rejects it + logs alarm (digest cached ≤ high_watermark, G6/B10) |
+| H13 | Boot with 4 of 6 peers present | quorum reached; the 4 proceed to PBFT_STATE_NORMAL (PBFT_BOOT_MIN_PEERS=4, C14) |
+| H14 | Boot with 3 of 6 peers present | stays in discovery; no node reaches PBFT_STATE_NORMAL (below PBFT_BOOT_MIN_PEERS, C14) |
+| H15 | Y-5 re-key with a message in flight | message sent under the old key just before re-gen still verifies within PBFT_Y5_GRACE_MS=5000 (dual-key grace, G9/B11); consensus not paused |
 
 ### 3.3 Run command
 
@@ -226,6 +300,7 @@ The hardest tier. We need to **deliberately make nodes Byzantine** to verify the
 | BF5 | Primary silent | Primary skips Pre-Prepare for 3 TXs | view-change trigger |
 | BF6 | Conflicting digest | Send Pre-Prepare(10, A) then (10, B) | digest disagreement → view-change |
 | BF7 | Cascade | All 6 Byzantine replicas attack simultaneously | safety MUST hold |
+| BF8 | Prepare drop / loss recovery | Selectively drop one replica's Prepare for a seq | the waiting node rebroadcasts on `timeout_ms / 2`, up to `PBFT_MAX_RETRIES`=3 (`retry_count`); if quorum still not reached after 3 retries it triggers a view-change (G8/B8) |
 
 ### 6.3 Safety verification
 
@@ -246,7 +321,20 @@ For each scenario:
 2. Assert: all 100 commit within 30 s
 3. If fails: liveness violated (or scenario made cluster unrecoverable — both are bugs)
 
-### 6.5 Run command
+### 6.5 Retransmit / packet-loss recovery (BF8)
+
+BF8 needs assertions on the per-entry `retry_count` counter, not just the final outcome:
+
+1. Drop exactly one replica's Prepare for a chosen `seq`; let virtual time advance.
+2. Assert the waiting node rebroadcasts its Prepare each `timeout_ms / 2` and increments
+   `retry_count` once per rebroadcast, capping at `PBFT_MAX_RETRIES`=3 (no 4th rebroadcast).
+3. **Recovery path:** if the dropped Prepare is then allowed through before the 3rd retry,
+   the seq commits and `retry_count` stops advancing.
+4. **Escalation path:** if quorum is still not reached after `retry_count == PBFT_MAX_RETRIES`,
+   assert the node triggers a view-change (PBFT_STATE_VIEW_CHANGE) and the cluster resumes
+   under the new primary (G8/B8).
+
+### 6.6 Run command
 
 ```bash
 cd tools/byzantium

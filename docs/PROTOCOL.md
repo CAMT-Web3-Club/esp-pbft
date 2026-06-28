@@ -32,12 +32,16 @@ All messages share a **common wire format** regardless of transport. Switching t
 
 ```c
 // pbft_network.h
+// Transport-internal status enum. Renamed from the old `pbft_net_err_t` to avoid
+// clashing with API-REFERENCE's public `pbft_err_t`. The transport layer maps
+// pbft_transport_status_t -> pbft_err_t (PBFT_NET_ERR_TIMEOUT=-50, _INVALID=-51,
+// _FULL=-52, _NO_ROUTE=-53). See API-REFERENCE §3.
 typedef enum {
-    PBFT_NET_OK              = 0,
-    PBFT_NET_ERR_TIMEOUT     = -1,
-    PBFT_NET_ERR_INVALID     = -2,
-    PBFT_NET_ERR_FULL        = -3,
-} pbft_net_err_t;
+    PBFT_TX_OK      =  0,
+    PBFT_TX_TIMEOUT = -1,
+    PBFT_TX_INVALID = -2,
+    PBFT_TX_FULL    = -3,
+} pbft_transport_status_t;
 
 typedef struct {
     uint8_t  my_node_id;                  // 0..6
@@ -48,10 +52,10 @@ typedef struct {
 // Transport ops (function pointer table)
 typedef struct {
     const char* name;                      // "esp-now" / "wifi-udp"
-    pbft_net_err_t (*init)(const pbft_net_config_t* cfg);
-    pbft_net_err_t (*deinit)(void);
-    pbft_net_err_t (*broadcast)(const void* buf, size_t len);
-    pbft_net_err_t (*unicast)(uint8_t peer_id, const void* buf, size_t len);
+    pbft_transport_status_t (*init)(const pbft_net_config_t* cfg);
+    pbft_transport_status_t (*deinit)(void);
+    pbft_transport_status_t (*broadcast)(const void* buf, size_t len);
+    pbft_transport_status_t (*unicast)(uint8_t peer_id, const void* buf, size_t len);
     bool (*is_ready)(void);
 } pbft_transport_t;
 
@@ -70,7 +74,7 @@ extern const pbft_transport_t* pbft_get_transport(void);  // returns &pbft_trans
 **API used:** `esp_now_send()`, `esp_now_register_send_cb()`, `esp_now_add_peer()`
 
 ```c
-static pbft_net_err_t espnow_init(const pbft_net_config_t* cfg) {
+static pbft_transport_status_t espnow_init(const pbft_net_config_t* cfg) {
     esp_now_init();
     esp_now_register_send_cb(espnow_send_cb);
     // Register all 6 peers as broadcast-capable
@@ -83,13 +87,13 @@ static pbft_net_err_t espnow_init(const pbft_net_config_t* cfg) {
         };
         esp_now_add_peer(&peer);
     }
-    return PBFT_NET_OK;
+    return PBFT_TX_OK;
 }
 
-static pbft_net_err_t espnow_broadcast(const void* buf, size_t len) {
-    if (len > 250) return PBFT_NET_ERR_INVALID;  // ESP-NOW limit
+static pbft_transport_status_t espnow_broadcast(const void* buf, size_t len) {
+    if (len > PBFT_ESP_NOW_MAX_PAYLOAD) return PBFT_TX_INVALID;  // ESP-NOW limit
     return esp_now_send(PBFT_ESP_NOW_BROADCAST_MAC, buf, len) == ESP_OK
-           ? PBFT_NET_OK : PBFT_NET_ERR_FULL;
+           ? PBFT_TX_OK : PBFT_TX_FULL;
 }
 ```
 
@@ -112,7 +116,7 @@ The `PBFT_ESP_NOW_BROADCAST_MAC` constant is defined in `pbft_network_espnow.h`:
 #define PBFT_MCAST_GROUP  "239.42.0.7"   // site-local, scoped
 #define PBFT_MCAST_PORT   7707
 
-static pbft_net_err_t wifi_udp_init(const pbft_net_config_t* cfg) {
+static pbft_transport_status_t wifi_udp_init(const pbft_net_config_t* cfg) {
     // 1. Start Wi-Fi in AP mode
     esp_netif_create_default_wifi_ap();
     esp_wifi_set_mode(WIFI_MODE_AP);
@@ -140,7 +144,7 @@ static pbft_net_err_t wifi_udp_init(const pbft_net_config_t* cfg) {
 
     // 4. Map node_id → IP (config or DHCP lease table)
     //    node_id 0 = 192.168.4.1, node_id 1 = 192.168.4.2, etc.
-    return PBFT_NET_OK;
+    return PBFT_TX_OK;
 }
 ```
 
@@ -214,15 +218,39 @@ All PBFT messages start with a **4-byte common header**, followed by message-typ
    0                   1                   2                   3
    0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-  |  msg_type     |  sender_id    |          reserved             |
+  |  msg_type     |  sender_id    | proto_version |   reserved    |
   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 
-  msg_type  : uint8  = PBFT_MSG_* (see §5)
-  sender_id : uint8  = 0..6 (PBFT_CLUSTER_SIZE)
-  reserved  : uint16 = 0 (MBZ; for future use)
+  msg_type      : uint8  = PBFT_MSG_* (see §5)
+  sender_id     : uint8  = 0..6 (PBFT_CLUSTER_SIZE)
+  proto_version : uint8  = PBFT_WIRE_VERSION (= 1)
+  reserved      : uint8  = 0 (MBZ; for future use)
+```
+
+```c
+// Wire-format version. Increment ONLY on a wire-incompatible change.
+// v1 is frozen by this document.
+#define PBFT_WIRE_VERSION   1
+
+// Packed common header (4 bytes). memcpy-(de)serialized per CODING_STANDARD.
+typedef struct __attribute__((packed)) {
+    uint8_t msg_type;       // PBFT_MSG_*
+    uint8_t sender_id;      // 0..6
+    uint8_t proto_version;  // = PBFT_WIRE_VERSION
+    uint8_t reserved;       // MBZ
+} pbft_common_header_t;     // sizeof == 4
 ```
 
 **Total common header:** 4 bytes. Little-endian for multi-byte fields.
+
+**Wire-version check (receiver, mandatory):** every received packet MUST have
+`proto_version == PBFT_WIRE_VERSION`; a packet whose `proto_version` differs is
+**rejected** (counted as a dropped/invalid packet, same as a failed MAC). Setting
+`proto_version` in the common header and enforcing this check on receive **freezes
+the v1 wire format** — a future wire-incompatible change bumps `PBFT_WIRE_VERSION`
+and old nodes will reject new-format packets rather than misparse them. See §11
+(receive path) and §13 (open question P3). All nodes in a cluster MUST run the same
+`PBFT_WIRE_VERSION` (rolling-OTA rule, cross-ref [DEPLOYMENT.md §5.2](./DEPLOYMENT.md)).
 
 ### 4.2 Endianness
 
@@ -293,7 +321,8 @@ Used for cluster discovery + soft re-handshake (Pattern Y-5).
 |-------|------|-------|
 | `msg_type` | 1 B | = 0 (PBFT_MSG_HELLO) |
 | `sender_id` | 1 B | 0..6 |
-| `reserved` | 2 B | MBZ |
+| `proto_version` | 1 B | = PBFT_WIRE_VERSION (1); receiver rejects on mismatch |
+| `reserved` | 1 B | MBZ |
 | `pubkey` | 65 B | uncompressed P-256: `0x04` (1 B) ‖ `X` (32 B, big-endian) ‖ `Y` (32 B, big-endian). Matches `psa_export_public_key()` output verbatim and `psa_import_key()` requirement for `PSA_KEY_TYPE_ECC_PUBLIC_KEY(SECP_R1)`. |
 | `re_handshake` | 1 B | 0 = first hello, 1 = re-handshake marker |
 | `mac` | 32 B | HMAC-SHA256 over (common header ‖ pubkey ‖ re_handshake) using current `hmac_keys[sender_id]` if known, or zero-filled if first hello (TOFU) |
@@ -340,7 +369,7 @@ Primary assigns sequence number and broadcasts TX.
 | `digest` | 32 B | SHA-256 of TX payload (allows prepare/commit without full payload) |
 | `payload_len` | 2 B | 0-256 |
 | `payload` | 0-256 B | actual TX bytes |
-| `mac` | 32 B | HMAC over (common header ‖ view ‖ seq ‖ digest ‖ payload) |
+| `mac` | 32 B | HMAC-SHA256 over (common header ‖ view ‖ seq ‖ digest ‖ payload). The common header is the FIRST 4 bytes — so `msg_type` (header byte 0) and `sender_id` (header byte 1) are BOTH bound by the MAC (anti-spoof). `msg_type` is NOT a standalone field between seq and digest. See §7 and [CRYPTO.md §5](./CRYPTO.md#5-per-message-mac). |
 
 **Padding:** if `payload_len` is odd, insert 1 B pad to keep `mac` at 4-byte boundary (saves 1 padding B elsewhere).
 
@@ -445,7 +474,21 @@ New primary broadcasts its proof + new Pre-Prepare messages.
 
 ## 7. MAC computation (recap from CRYPTO.md)
 
-For every message except Hello-initial, MAC input = `view ‖ sequence ‖ msg_type ‖ digest ‖ payload`. Full details in [CRYPTO.md §5](./CRYPTO.md#5-per-message-mac).
+For every message except the initial (TOFU) Hello, the MAC is
+`HMAC-SHA256(hmac_keys[sender_id], mac_input)` producing a 32-byte tag, where:
+
+```
+mac_input = common_header ‖ view(u32 LE) ‖ sequence(u64 LE) ‖ digest[32] ‖ payload[payload_len]
+
+common_header (4 bytes) = msg_type(u8) ‖ sender_id(u8) ‖ proto_version(u8) ‖ reserved(u8)
+```
+
+Key points (must match [CRYPTO.md §5](./CRYPTO.md#5-per-message-mac) exactly):
+- `msg_type` is the **first byte of the common header**, NOT a standalone field
+  placed between `sequence` and `digest`.
+- `sender_id` (header byte 1) **is bound** by the MAC — this prevents a Byzantine
+  node from replaying another node's message under a forged `sender_id`.
+- Integers are little-endian; `digest`, `pubkey`, and the MAC tag are raw canonical bytes.
 
 ---
 
@@ -499,6 +542,11 @@ malicious or buggy caller violates the compile-time constraint.
 
 ### 8.2 Single-transport runtime (compile-time-selected)
 
+There is exactly **one** transport, chosen at compile time and exposed as
+`pbft_default_transport` (= `pbft_get_transport()`, §2.1). Both Pre-Prepare and
+New-View are sent through that same single transport — there is no separate
+runtime `udp_transport`, and transports are **not** "both initialized at boot."
+
 ```c
 esp_err_t pbft_send_pre_prepare(const pbft_msg_t* msg) {
     size_t total_len = msg->payload_len + 82;  // 82 = header overhead
@@ -507,15 +555,20 @@ esp_err_t pbft_send_pre_prepare(const pbft_msg_t* msg) {
     // (defensive runtime check; should be unreachable if _Static_assert passed).
     return pbft_default_transport->broadcast(msg, total_len);
 }
-```
 
-esp_err_t pbft_send_new_view(const pbft_new_view_t* nv) {
-    // Always use UDP — New-View doesn't fit in ESP-NOW
-    return udp_transport.broadcast(nv, sizeof(*nv));
+esp_err_t pbft_send_new_view(const pbft_new_view_t* nv, size_t nv_len) {
+    // Sent via the SAME single compiled default_transport. New-View (~5.9 KB worst
+    // case) only fits when the build selected CONFIG_PBFT_TRANSPORT_WIFI_UDP. Under
+    // CONFIG_PBFT_TRANSPORT_ESP_NOW, view-change (hence New-View) is NOT supported
+    // (see §8.1, Option B); the call returns PBFT_NET_ERR_INVALID at runtime.
+    return pbft_default_transport->broadcast(nv, nv_len);
 }
 ```
 
-This requires both transports to be **initialized at boot** even if ESP-NOW is "default" (additional ~30 KB RAM).
+Because view-change requires sending the ~5.9 KB New-View message, **view-change as
+a feature requires the `CONFIG_PBFT_TRANSPORT_WIFI_UDP=y` build** (see §8.1). The
+ESP-NOW build does not support New-View. Only the one selected transport is
+initialized at boot.
 
 ---
 
@@ -599,6 +652,7 @@ This is **not** the same as the public-key cache (TOFU) — see [CRYPTO.md §6](
    pbft_network_dispatch(buf, len, sender_id)
       → extracts sender_id from header
       → if len < 4 || msg_type invalid → drop
+      → if proto_version != PBFT_WIRE_VERSION → drop (count as invalid)  // §4.1
                 │
                 ▼
    pbft_crypto_verify_mac(msg, sender_id)
@@ -637,7 +691,7 @@ This is **not** the same as the public-key cache (TOFU) — see [CRYPTO.md §6](
 |---|----------|--------|
 | P1 | Should we use Wi-Fi UDP by default given New-View constraint? | 🟡 Open |
 | P2 | ESP-NOW fragmentation worth it? | 🟡 No (UDP fallback simpler) |
-| P3 | Should we add message-type versioning? | 🟡 Open (future) |
+| P3 | Should we add message-type versioning? | ✅ Resolved — `proto_version` byte in common header (§4.1), `PBFT_WIRE_VERSION=1`; receiver rejects on mismatch, freezing the v1 wire format |
 | P4 | Compress payload for Pre-Prepare? | 🟡 No (overhead > savings at 256 B) |
 
 ---

@@ -51,28 +51,45 @@ static pbft_node_desc_t s_cluster_members[7];   // 7 × ~16 B = ~112 B
 static pbft_log_entry_t s_log[PBFT_LOG_MAX_ENTRIES];   // 100 × ~360 B = ~36 KB
 ```
 
+This is **THE** canonical `pbft_log_entry_t` (single source of truth; CONSENSUS &
+CHECKPOINT must match this exactly or reference it — see DECISIONS G4):
+
 ```c
+typedef enum {
+    PBFT_ENTRY_FREE = 0,
+    PBFT_ENTRY_PRE_PREPARED,
+    PBFT_ENTRY_PREPARED,
+    PBFT_ENTRY_COMMITTED,
+    PBFT_ENTRY_EXECUTED,
+} pbft_entry_state_t;
+
 typedef struct {
-    uint32_t   view;                       //  4 B
-    uint64_t   sequence;                   //  8 B
-    uint8_t    digest[32];                 // 32 B
-    uint8_t    state;                      //  1 B  (FREE / PRE_PREPARED / PREPARED / COMMITTED / EXECUTED)
-    uint8_t    primary_id;                 //  1 B
-    uint8_t    have_pre_prepare;           //  1 B
-    uint16_t   payload_len;                //  2 B
-    uint8_t    prepare_bitmask;            //  1 B
-    uint8_t    commit_bitmask;             //  1 B
-    uint8_t    exec_bitmask;               //  1 B
-    uint8_t    is_checkpoint;              //  1 B
-    uint8_t    gc_marked;                  //  1 B
-    uint64_t   state_entered_ms;           //  8 B
-    uint64_t   commit_received_ms;         //  8 B
-    uint8_t    payload[PBFT_TX_PAYLOAD_MAX];  // 256 B  (inline — audit A5)
-    padding                               // ~34 B (alignment)
+    uint64_t           sequence;            //  8 B  assigned by primary
+    uint32_t           view;                //  4 B  view it was pre-prepared in
+    uint8_t            digest[32];          // 32 B  SHA-256 of request payload
+    uint8_t            msg_type;            //  1 B  request type tag
+    uint16_t           payload_len;         //  2 B  bytes used in payload[]
+    uint8_t            payload[256];        // 256 B inline request (PBFT_TX_PAYLOAD_MAX)
+    pbft_entry_state_t state;               //  4 B  FREE/PRE_PREPARED/PREPARED/COMMITTED/EXECUTED
+    uint8_t            prepare_bitmask;     //  1 B  bit i = replica i sent Prepare
+    uint8_t            commit_bitmask;      //  1 B  bit i = replica i sent Commit
+    uint8_t            exec_bitmask;        //  1 B  bit i = replica i confirmed Execute (checkpoint)
+    bool               have_pre_prepare;    //  1 B  this entry has a stored Pre-Prepare
+    bool               own_prepare_sent;    //  1 B  this node broadcast its Prepare
+    bool               own_commit_sent;     //  1 B  this node broadcast its Commit
+    bool               is_checkpoint;       //  1 B  sequence is a checkpoint boundary
+    uint8_t            retry_count;         //  1 B  retransmits so far (<= PBFT_MAX_RETRIES)
+    uint64_t           state_entered_ms;    //  8 B  timestamp of last state transition
+    uint64_t           commit_received_ms;  //  8 B  timestamp first Commit observed
+    // padding for alignment                // ~16 B
     // ————————————————————————————————————————————————
     // Total                                  ~360 B
 } pbft_log_entry_t;
 ```
+
+Quorum counts come from `__builtin_popcount(entry->prepare_bitmask)` etc. — there are
+**no** `prepare_count` / `commit_count` fields and **no** per-entry `app_cb` (the commit
+callback is registered once globally, API-REFERENCE §5).
 
 **Compilation check:**
 
@@ -99,8 +116,8 @@ typedef struct {
     uint64_t            next_sequence;
     uint64_t            last_committed_seq;
     uint64_t            last_executed_seq;
-    uint64_t            low_watermark;
-    uint64_t            high_watermark;
+    // NOTE: low/high watermark live in pbft_watermark_state_t (§2.7), NOT here —
+    //       view_state must NOT duplicate them (single owner = pbft_watermark_state_t).
     uint8_t             vc_set_count;
     uint8_t             vc_set_from[7];
     const pbft_view_change_t* vc_set[7];
@@ -151,6 +168,10 @@ Eight slots support one in-flight checkpoint proof per node plus headroom.
 ```c
 static pbft_watermark_state_t s_watermarks;   // ~50 B
 ```
+
+**Watermark ownership:** `pbft_watermark_state_t` is the *single* owner of `low_watermark`
+and `high_watermark`. `pbft_view_state_t` (§2.4) MUST NOT duplicate these fields.
+`high_watermark = low_watermark + PBFT_LOG_MAX_ENTRIES` (CHECKPOINT.md §4 is canonical).
 
 ### 2.8 Network buffers
 

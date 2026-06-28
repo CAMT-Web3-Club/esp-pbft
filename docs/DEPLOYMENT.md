@@ -297,6 +297,23 @@ t=6:00   All 7 nodes updated
 
 Each individual OTA has < 60 s downtime. The cluster never loses quorum (always ≥ 5 honest nodes running).
 
+#### Wire-version compatibility (G3 / PROTOCOL §4.1)
+
+All nodes in a cluster **must** run the same `PBFT_WIRE_VERSION` (the `proto_version` byte in
+the common wire header). The wire format is frozen within a major version:
+
+- A rolling OTA **must NOT** change the wire format within a major version. If a release bumps
+  `PBFT_WIRE_VERSION`, it is **not** a rolling-OTA-compatible upgrade — the cluster cannot be
+  partially upgraded across a version boundary.
+- During the rolling window above, every running node (old and new firmware) carries the **same**
+  `PBFT_WIRE_VERSION`, so all packets interoperate.
+- A receiver rejects any packet whose `proto_version != PBFT_WIRE_VERSION` (counted as a
+  dropped/invalid packet — see PROTOCOL §4.1). A mismatched-version node therefore cannot
+  participate in consensus; it is effectively absent until it runs a compatible build.
+
+To change `PBFT_WIRE_VERSION` (a breaking wire change), schedule cluster downtime and flash all
+nodes to the new major version together, rather than a rolling OTA.
+
 ### 5.3 OTA verification
 
 After OTA, each node should:
@@ -368,6 +385,38 @@ CONFIG_ESPNOW_WAKE_INTERVAL=200
 ```
 
 The first entry is the IDF v6.0.1 API contract; without it, `esp_now_set_wake_window()` is documented to no-op when the STA is disconnected. Even though most targets default it to `y`, pin it explicitly in `sdkconfig.defaults` so CI configurations cannot regress it (notably C5/C61 where the default depends on `CONFIG_ESP_HOST_WIFI_ENABLED`).
+
+### 6.6 Replace a permanently dead node
+
+A node that is permanently lost (bricked factory partition, hardware failure, physical loss)
+must be physically replaced and the replacement re-provisioned into the cluster. The cluster's
+fault tolerance is `f = 2`, so it tolerates **at most 2 simultaneous permanent failures**
+(`n = 7`, quorum `2f+1 = 5`). If a third node is also down, restore at least one to a working
+state before attempting a replacement.
+
+Runbook (perform within the physical-security window — see §3.1, FAILURE-MODES §5.1):
+
+1. **Provision the replacement** with the dead node's `my_node_id` (NVS), per §2.2. The new
+   board has a different factory MAC, so the node-MAC table must be updated on every peer.
+2. **Re-provision the node-MAC table on all surviving peers.** Write the replacement's MAC into
+   the `pbft_cluster` NVS namespace (`node_<id>_mac`) on **all** peers, replacing the dead
+   node's old MAC. (ESP-NOW uses the MAC directly; a stale MAC means peers never deliver to the
+   replacement.)
+3. **Clear the cached pubkey for that `node_id` on all peers** so TOFU re-captures the new key.
+   Peer pubkeys are held in RAM only (G10), so a reboot of each peer already clears its cache;
+   the replacement's first Hello is then trusted as a fresh TOFU. If you cannot reboot a peer,
+   it must expose an operator hook to evict the cached pubkey for that `node_id`.
+4. **Reboot the cluster (or the affected peers) within the physical-security window** so that
+   every peer re-runs TOFU and captures the replacement's pubkey on the same trusted channel.
+   Because pubkeys are RAM-only, each boot re-runs the discovery/TOFU window — the
+   physical-security assumption (§3.1) must hold for **every** boot, not just first-ever
+   deployment.
+5. **Verify** the replacement reaches `PBFT ready` and that all peers log a Hello + ECDH for the
+   new node (see §3.3). Confirm no `PBFT_ALARM_TOFU_MISMATCH` remains outstanding for that
+   `node_id`.
+
+> The MAC table lives in NVS; **pubkeys do not** (G10 — pubkeys are RAM-only, re-captured via
+> TOFU on each boot). There is no NVS-cached pubkey that would let a reboot skip re-TOFU.
 
 ---
 

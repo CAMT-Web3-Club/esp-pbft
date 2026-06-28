@@ -257,6 +257,27 @@ We use `SHA-256(shared || "PBFT-HMAC-v1")` instead of HKDF-Extract+Expand becaus
 
 For our use case (single 32-byte HMAC key per peer, fixed inputs), simple SHA-256 is sufficient and simpler. **HKDF would be needed if we derived multiple sub-keys per peer** (e.g., one for encrypt, one for MAC) — not our case.
 
+### 4.2.1 SHA-256 helpers (two distinct functions)
+
+Two SHA-256 helpers exist and MUST NOT be confused:
+
+```c
+// Plain SHA-256 of an arbitrary buffer. Used for TX digests (CONSENSUS pbft_submit).
+// out[32] receives SHA-256(in[0..len-1]).
+esp_err_t pbft_sha256(const uint8_t *in, size_t len, uint8_t out[32]);
+
+// Key-derivation helper: out[32] = SHA-256(secret ‖ label).
+// Used ONLY to derive a pairwise HMAC key from the ECDH shared secret (§4.1 step c).
+esp_err_t pbft_sha256_derive(const uint8_t *secret, size_t secret_len,
+                             const uint8_t *label,  size_t label_len,
+                             uint8_t out[32]);
+```
+
+- `pbft_sha256()` is the plain message hash — a single buffer in, a 32-byte digest out.
+  CONSENSUS computes the per-TX `digest` with this function (see G18 / [CONSENSUS.md](./CONSENSUS.md) §5.2).
+- `pbft_sha256_derive()` is the KDF wrapper used at boot/re-gen; it concatenates a
+  domain-separation label (`"PBFT-HMAC-v1"`) before hashing. It is NOT a general hash.
+
 ### 4.3 Boot quorum requirement (partial Hello handling)
 
 `pbft_discovery_wait(5000)` does not require **all** 6 peers to reply. We need enough to:
@@ -291,46 +312,62 @@ esp_err_t pbft_discovery_wait(uint32_t timeout_ms) {
 ### 5.1 MAC input format
 
 ```
-MAC input (concatenated, no length prefix):
+MAC input (common-header-first; concatenated, no length prefix):
+  common_header : 4 bytes =
+      msg_type(u8)      (Pre-Prepare=1, Prepare=2, Commit=3, etc.)
+    ‖ sender_id(u8)     (0..6 — BOUND, anti-spoof)
+    ‖ proto_version(u8) (= PBFT_WIRE_VERSION)
+    ‖ reserved(u8)
   view      : u32  (4 bytes, little-endian)
   sequence  : u64  (8 bytes, little-endian)
-  msg_type  : u8   (1 byte: Pre-Prepare=1, Prepare=2, Commit=3, etc.)
   digest    : 32 bytes (SHA-256 of TX payload, or all-zeros for non-TX msgs)
   payload   : variable (0-256 bytes, TX payload for Pre-Prepare; empty otherwise)
 ────────────────────────────────────────────────────────────
-  Total     : 45 bytes minimum (view+seq+type+digest)
+  Total     : 48 bytes minimum (common_header+view+seq+digest)
 ```
+
+The canonical byte order is:
+`common_header(msg_type‖sender_id‖proto_version‖reserved) ‖ view ‖ sequence ‖ digest ‖ payload`.
+`msg_type` is the FIRST byte (inside the common header), not a standalone field
+between `sequence` and `digest`.
 
 ### 5.2 Why this input format?
 
 | Field | Purpose |
 |-------|---------|
+| `msg_type` | Domain separation (Pre-Prepare MAC ≠ Prepare MAC) |
+| `sender_id` | Binds message to its claimed sender (anti-spoof — a captured MAC cannot be re-attributed to a different node) |
+| `proto_version` | Binds to the wire format version (rejects cross-version replay) |
 | `view` | Anti-replay across view changes (old-view messages rejected) |
 | `sequence` | Anti-replay within view (monotonic check) |
-| `msg_type` | Domain separation (Pre-Prepare MAC ≠ Prepare MAC) |
 | `digest` | Binds message to specific TX content |
 | `payload` | Authenticates actual TX bytes |
 
-Without `view‖sequence`, an attacker could replay an old (committed) Prepare to confuse a slow replica. Without `msg_type`, a Prepare MAC could be reused as Commit MAC.
+Without `view‖sequence`, an attacker could replay an old (committed) Prepare to confuse a slow replica. Without `msg_type`, a Prepare MAC could be reused as Commit MAC. Without `sender_id` bound, a captured MAC could be re-attributed to a different node.
 
 ### 5.3 HMAC compute
 
 ```c
-// pbft_compute_mac(peer_id, view, seq, type, digest, payload, payload_len, mac_out)
+// pbft_compute_mac(peer_id, sender_id, view, seq, type, digest, payload, payload_len, mac_out)
+//   sender_id is the node that originated the message (bound into the MAC).
 esp_err_t pbft_compute_mac(uint8_t peer_id,
+                             uint8_t sender_id,
                              uint32_t view, uint64_t seq, uint8_t type,
                              const uint8_t digest[32],
                              const uint8_t* payload, size_t payload_len,
                              uint8_t mac_out[32]) {
-    uint8_t buf[45 + 256];   // stack, bounded
+    uint8_t buf[48 + 256];   // stack, bounded (4 hdr + 4 view + 8 seq + 32 digest + payload)
     size_t off = 0;
 
+    // Write common_header: msg_type ‖ sender_id ‖ proto_version ‖ reserved (4 bytes, FIRST)
+    buf[off++] = type;                 // msg_type
+    buf[off++] = sender_id;            // sender_id (BOUND — anti-spoof)
+    buf[off++] = PBFT_WIRE_VERSION;    // proto_version
+    buf[off++] = 0;                    // reserved
     // Write view (LE)
     memcpy(buf + off, &view, 4);  off += 4;
     // Write sequence (LE)
     memcpy(buf + off, &seq, 8);   off += 8;
-    // Write type
-    buf[off++] = type;
     // Write digest
     memcpy(buf + off, digest, 32); off += 32;
     // Write payload (if any)
@@ -341,7 +378,7 @@ esp_err_t pbft_compute_mac(uint8_t peer_id,
     }
 
     // HMAC-SHA256 (uses ESP32-C3 SHA HW peripheral)
-    size_t mac_len = 0;
+    size_t mac_len;
     psa_status_t s = psa_mac_compute(hmac_key_ids[peer_id],
                                      PSA_ALG_HMAC(PSA_ALG_SHA_256),
                                      buf, off,
@@ -359,14 +396,15 @@ esp_err_t pbft_compute_mac(uint8_t peer_id,
 
 ```c
 esp_err_t pbft_verify_mac(uint8_t peer_id,
+                            uint8_t sender_id,
                             uint32_t view, uint64_t seq, uint8_t type,
                             const uint8_t digest[32],
                             const uint8_t* payload, size_t payload_len,
                             const uint8_t received_mac[32]) {
     uint8_t calc_mac[32];
 
-    // 1. Re-compute expected MAC
-    esp_err_t err = pbft_compute_mac(peer_id, view, seq, type, digest,
+    // 1. Re-compute expected MAC (sender_id is bound into the common header)
+    esp_err_t err = pbft_compute_mac(peer_id, sender_id, view, seq, type, digest,
                                       payload, payload_len, calc_mac);
     if (err != ESP_OK) return err;
 
@@ -407,26 +445,37 @@ esp_err_t pbft_on_hello(const pbft_hello_t* hello) {
     bool first_hello = !peer_pubkey_cached[peer];
 
     if (first_hello) {
+        // VERY FIRST Hello of a never-seen peer (TOFU): a zero MAC is accepted ONLY here.
         // Cache the pubkey (first wins)
         memcpy(peer_pubkey_cached[peer], hello->pubkey, 65);
         // Compute HMAC key with new peer
         pbft_derive_hmac_key(peer, hello->pubkey);
-        // MAC may be zeros (peer has no key yet) — accept
-        ESP_LOGW(TAG, "First hello from node %d — TOFU trust", peer);
+        ESP_LOGW(TAG, "First hello from node %d — TOFU trust (zero MAC permitted)", peer);
     } else {
-        // Subsequent hellos: pubkey MUST match
-        if (memcmp(peer_pubkey_cached[peer], hello->pubkey, 65) != 0) {
-            ESP_LOGE(TAG, "Hello from node %d has different pubkey! Alarm!", peer);
-            return ESP_ERR_INVALID_PEER;
+        // KNOWN peer. A re_handshake=1 Hello (peer rolled its key, §7) carries a NEW
+        // pubkey but MUST prove it with a valid MAC under the CURRENT hmac_keys[peer]
+        // (the key still in force before this Hello). A zero/invalid MAC is rejected —
+        // zero MAC is permitted ONLY for the very first Hello of a never-seen peer above.
+        if (hello->re_handshake) {
+            if (pbft_verify_hello_mac(peer, hello) != ESP_OK) {
+                ESP_LOGE(TAG, "re_handshake Hello from node %d failed MAC! Reject.", peer);
+                return ESP_ERR_INVALID_MAC;   // do NOT accept the new pubkey
+            }
+            // MAC verified under the current key → accept the rolled pubkey (§7.3).
+        } else {
+            // Plain (non-re_handshake) Hello from a known peer: pubkey MUST match cache.
+            if (memcmp(peer_pubkey_cached[peer], hello->pubkey, 65) != 0) {
+                ESP_LOGE(TAG, "Hello from node %d has different pubkey! Alarm!", peer);
+                return ESP_ERR_INVALID_PEER;
+            }
+            // MAC verified under the current hmac_keys[peer].
         }
-        // Verify MAC with current hmac_keys[peer]
-        // (re_handshake may be 1 — meaning peer regenerated key, but TOFU says first wins)
     }
     return ESP_OK;
 }
 ```
 
-**TOFU trust model:** First Hello from a peer is trusted. Subsequent Hellos must match cached pubkey. If mismatch → log alarm and refuse.
+**TOFU trust model:** First Hello from a peer is trusted (zero MAC permitted). Subsequent Hellos must match cached pubkey, except a `re_handshake=1` Hello which may carry a new pubkey **only if** its MAC verifies under the current key. A `re_handshake=1` Hello from a KNOWN peer with a zero or invalid MAC is rejected — the zero-MAC exception applies solely to the first-ever Hello of a never-seen peer. If a plain Hello's pubkey mismatches the cache → log alarm and refuse.
 
 ---
 
@@ -457,18 +506,34 @@ With `PBFT_Y5_NODE_OFFSET_MS = 1 h` and `PBFT_CLUSTER_SIZE = 7`:
 
 All 7 nodes re-gen within a 6 h window; full cluster cycle is 24 h.
 
-### 7.2 Grace period during transition
+### 7.2 Grace period during transition (keep-old-keys, no consensus pause)
 
-When node N fires its Y-5 timer:
+```c
+#define PBFT_Y5_GRACE_MS   5000   // 5 s: window in which old HMAC keys remain valid for RX
+```
 
-1. **t=0**: Node N destroys its old keypair and generates a new one (§7.3).
-2. **t=0..30 s**: Node N is in **transition** — it has a new pubkey but no peers know yet. It **cannot verify** incoming MACs (peers still sign with old HMAC key from N's perspective) and peers **cannot verify** its MACs (peers still expect HMAC key derived from N's old pubkey).
-3. **t=30 s**: Timeout. If N has not received `re_handshake=1` Hellos from all 6 peers with the **new** pubkey, N broadcasts a Hello **announce** (3 times, 1 s apart).
-4. **t=2 min hard limit**: If after 2 minutes any peer still hasn't responded, N logs a **partition alarm** and falls back to: continue with new keypair alone, accepting that those peers will reject its messages until they re-discover N.
+When node N fires its Y-5 timer, it does **not** destroy the old keys immediately and
+consensus is **never paused**. Instead:
 
-**Why 30 s?** Typical ESP-NOW re-discovery latency on a quiet channel is ~5 s; 30 s covers 6× slack. Most peers will see the re_handshake Hello within 1-2 s.
+1. **t=0**: Node N derives its NEW keypair (§7.3) but **keeps the old `hmac_keys[]` arena**
+   alongside the new one. It broadcasts a `re_handshake=1` Hello signed under its CURRENT
+   (old) key so peers can verify the roll.
+2. **t=0..PBFT_Y5_GRACE_MS (5 s)**: Both keys are live. On the RX path, N (and every peer)
+   accepts a MAC that verifies under **either** the old OR the new key for the affected peer.
+   Messages in flight continue to be produced and verified throughout — there is no window in
+   which N "cannot verify". As each peer processes the re_handshake Hello it re-derives the
+   new key and starts signing with it.
+3. **t=PBFT_Y5_GRACE_MS**: The grace timer fires and N destroys the OLD HMAC keys
+   (`psa_destroy_key` + zeroize), leaving only the new keys. From here only the new key
+   verifies.
 
-**Why 2 min?** Beyond 2 min, either the peer is permanently down (N should view-change or alert) or the peer has lost N's new pubkey (peer is at fault). At 2 min, N broadcasts a fallback "RESYNC" message (just the new pubkey) for 5 retries 5 s apart.
+**Why 5 s?** Typical ESP-NOW re-discovery latency on a quiet channel is ~1-2 s; 5 s covers a
+comfortable margin for every peer to receive the re_handshake Hello and re-derive the new
+HMAC key before the old key is retired. Because both keys are accepted during the window,
+no message is dropped for a verification gap.
+
+> Note: there is no "30 s soft / 2 min hard" transition and no period in which N cannot
+> verify incoming MACs. The dual-key grace window replaces that earlier design.
 
 ### 7.3 Re-gen flow
 
@@ -477,10 +542,12 @@ When node N fires its Y-5 timer:
 void pbft_y5_timer_cb(void) {
     ESP_LOGI(TAG, "Y-5 re-gen triggered");
 
-    // 1. Destroy old keypair (zeroize)
-    psa_destroy_key(my_priv_key_id);
-    mbedtls_platform_zeroize(hmac_keys, sizeof(hmac_keys));
-    mbedtls_platform_zeroize(peer_pubkey_cached, sizeof(peer_pubkey_cached));
+    // 1. KEEP the old keys. Snapshot the current HMAC keys into the "old" arena so the RX
+    //    path can still verify under them during the grace window. Do NOT destroy yet,
+    //    and do NOT clear peer_pubkey_cached (peers are unchanged; only OUR keypair rolls).
+    memcpy(s_hmac_key_ids_old, s_hmac_key_ids, sizeof(s_hmac_key_ids));
+    s_old_keys_valid = true;
+    psa_key_id_t old_priv = my_priv_key_id;   // retain handle for grace window
 
     // 2. Generate new keypair (TRNG)
     psa_generate_key(&attr, &my_priv_key_id);
@@ -490,21 +557,47 @@ void pbft_y5_timer_cb(void) {
     psa_export_public_key(my_priv_key_id, new_pub, sizeof(new_pub), &len);
     assert(len == 65 && new_pub[0] == 0x04);
 
-    // 4. Broadcast Hello with re_handshake=1
+    // 4. Broadcast Hello with re_handshake=1, MAC'd under the CURRENT (old) key so peers
+    //    can verify the roll (a re_handshake Hello with zero/invalid MAC is rejected, §6.2).
     pbft_hello_t hello = {
         .msg_type    = PBFT_MSG_HELLO,
         .sender_id   = my_node_id,
         .re_handshake = 1,
     };
     memcpy(hello.pubkey, new_pub, 65);
+    pbft_sign_hello_mac(&hello);   // signed under old hmac_keys[]
     pbft_network_broadcast(&hello, sizeof(hello));
 
-    // 5. Wait for peers to re-ECDH (handled via Hello receive + soft re-handshake)
+    // 5. Peers re-ECDH on receiving the Hello (§7.3 soft re-handshake). During the grace
+    //    window the RX path accepts MACs under EITHER s_hmac_key_ids[] (new) or
+    //    s_hmac_key_ids_old[] (old). Consensus is NOT paused.
 
-    // 6. Restart 24h timer
+    // 6. Schedule destruction of the OLD keys AFTER the grace window (NOT now).
+    pbft_timer_start(PBFT_TIMER_Y5_GRACE, PBFT_Y5_GRACE_MS);
+    // (saved old_priv is destroyed in the grace callback too)
+
+    // 7. Restart 24h timer
     pbft_timer_start(PBFT_TIMER_Y5, 24 * 60 * 60 * 1000);
 }
+
+// pbft_y5_grace_cb() — fires PBFT_Y5_GRACE_MS after re-gen; retires the old keys.
+void pbft_y5_grace_cb(void) {
+    if (!s_old_keys_valid) return;
+    for (int p = 0; p < PBFT_CLUSTER_SIZE; p++) {
+        if (s_hmac_key_ids_old[p] != 0 && s_hmac_key_ids_old[p] != s_hmac_key_ids[p]) {
+            psa_destroy_key(s_hmac_key_ids_old[p]);
+        }
+        s_hmac_key_ids_old[p] = 0;
+    }
+    psa_destroy_key(s_old_priv);   // retired old private key
+    mbedtls_platform_zeroize(s_hmac_key_arena_old, sizeof(s_hmac_key_arena_old));
+    s_old_keys_valid = false;
+    ESP_LOGI(TAG, "Y-5 grace window elapsed — old keys destroyed");
+}
 ```
+
+> The old key is destroyed ONLY in `pbft_y5_grace_cb()`, after `PBFT_Y5_GRACE_MS`. The
+> re-gen path must NOT call `psa_destroy_key()` on the old key immediately.
 
 ### 7.3 Soft re-handshake (peer receives re-handshake Hello)
 
