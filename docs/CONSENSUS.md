@@ -331,7 +331,7 @@ uint64_t pbft_primary_assign_sequence(void) {
 }
 ```
 
-**Constraint:** `next_sequence > high_watermark` always (otherwise we exhaust log).
+**Constraint:** `next_sequence > pbft_watermark_get_high()` always (otherwise we exhaust log).
 
 ### 5.2 Handle submit() (primary path)
 
@@ -552,7 +552,7 @@ void pbft_gc_up_to(uint64_t stable_seq) {
 
 ```c
 bool pbft_log_full(void) {
-    return next_sequence > high_watermark;
+    return next_sequence > pbft_watermark_get_high();
 }
 ```
 

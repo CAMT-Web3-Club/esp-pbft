@@ -370,6 +370,14 @@ CONFIG_PBFT_Y5_REGEN_PERIOD_HOURS=1
 
 ### 6.5 ESP-NOW RX power-save Kconfig (esp-pbft defines + ESP-IDF default)
 
+> **Implementation status:** The Kconfig block below documents the **design**. The
+> actual `pbft/Kconfig` and `pbft_network_espnow.c` are **not yet created** — esp-pbft
+> is in design phase (HANDOVER §3.6). When implementation begins (ROADMAP P1), copy
+> the Kconfig block into `pbft/Kconfig` and the C snippet from POWER §9 into
+> `pbft_network_espnow.c`. The Espressif API names (`esp_now_set_wake_window`,
+> `esp_wifi_connectionless_module_set_wake_interval`) are verified to exist in
+> ESP-IDF v6.0.1.
+
 esp-pbft's ESP-NOW RX duty-cycling (POWER.md §9) needs both an ESP-IDF
 upstream Kconfig **and** esp-pbft-specific Kconfigs. The upstream
 `CONFIG_ESPNOW_*` options are only defined in

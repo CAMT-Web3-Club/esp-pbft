@@ -169,50 +169,56 @@ void pbft_crypto_boot(void) {
             continue;
         }
 
-        // (b) ECDH: shared = ECDH(my_priv, peer_pub_bytes)
-        //     Per TF-PSA-Crypto v1.0: psa_key_agreement accepts the peer's raw
-        //     uncompressed pubkey bytes directly — no need to import as a PSA key.
-        uint8_t shared[32];
-        size_t shared_len = 0;
-        s = psa_key_agreement(s_my_priv_key_id,
-                              s_peer_pub_arena[peer], 65,
-                              PSA_ALG_ECDH,
-                              shared, sizeof(shared), &shared_len);
-        if (s != PSA_SUCCESS || shared_len != 32) {
-            ESP_LOGE(TAG, "psa_key_agreement failed for peer %d: %d", peer, (int)s);
-            mbedtls_platform_zeroize(shared, sizeof(shared));
-            continue;
-        }
-
-        // (c) Derive HMAC key: SHA-256(shared || "PBFT-HMAC-v1")
-        uint8_t hmac_key[32];
-        pbft_sha256_derive(shared, sizeof(shared),
-                          (const uint8_t*)"PBFT-HMAC-v1", 13,
-                          hmac_key);
-
-        // (d) Destroy any prior HMAC key for this peer
+        // (b) ECDH → derive HMAC key directly via PSA (no raw shared secret in RAM).
+        //     Per TF-PSA-Crypto v1.0 (ESP-IDF v6.0.1 components/mbedtls/mbedtls/tf-psa-crypto/include/psa/crypto.h:4128):
+        //
+        //     psa_status_t psa_key_agreement(
+        //         mbedtls_svc_key_id_t private_key,
+        //         const uint8_t *peer_key,        // raw bytes, NOT a key_id_t
+        //         size_t peer_key_length,
+        //         psa_algorithm_t alg,
+        //         const psa_key_attributes_t *attributes,  // for the output derived key
+        //         mbedtls_svc_key_id_t *key);              // OUTPUT: a PSA key handle
+        //
+        //     The output is a PSA key handle, NOT a 32-byte raw shared secret.
+        //     We use it as an HMAC key directly — no SHA-256 derivation step,
+        //     no raw shared secret bytes sitting in RAM.
         if (s_hmac_key_ids[peer] != 0) {
-            psa_destroy_key(s_hmac_key_ids[peer]);
+            psa_destroy_key(s_hmac_key_ids[peer]);   // destroy any prior derived key
         }
-
-        // (e) Import the derived HMAC key as a PSA HMAC key
         psa_key_attributes_t hmac_attr = PSA_KEY_ATTRIBUTES_INIT;
         psa_set_key_type(&hmac_attr, PSA_KEY_TYPE_HMAC);
         psa_set_key_bits(&hmac_attr, 256);
         psa_set_key_algorithm(&hmac_attr, PSA_ALG_HMAC(PSA_ALG_SHA_256));
         psa_set_key_usage_flags(&hmac_attr, PSA_KEY_USAGE_SIGN_HASH | PSA_KEY_USAGE_VERIFY_HASH);
-        s = psa_import_key(&hmac_attr, hmac_key, 32, &s_hmac_key_ids[peer]);
+
+        s = psa_key_agreement(s_my_priv_key_id,
+                              s_peer_pub_arena[peer], 65,
+                              PSA_ALG_ECDH,
+                              &hmac_attr,
+                              &s_hmac_key_ids[peer]);
         if (s != PSA_SUCCESS) {
-            ESP_LOGE(TAG, "psa_import_key(HMAC) failed for peer %d: %d", peer, (int)s);
-            mbedtls_platform_zeroize(hmac_key, sizeof(hmac_key));
-            mbedtls_platform_zeroize(shared, sizeof(shared));
+            ESP_LOGE(TAG, "psa_key_agreement failed for peer %d: %d", peer, (int)s);
+            s_hmac_key_ids[peer] = 0;   // mark as invalid
             continue;
         }
-        memcpy(s_hmac_key_arena[peer], hmac_key, 32);
 
-        // Zeroize sensitive scratch
-        mbedtls_platform_zeroize(shared, sizeof(shared));
-        mbedtls_platform_zeroize(hmac_key, sizeof(hmac_key));
+        // (c) Cache a copy of the HMAC key bytes (for clearing on Y-5 destroy).
+        //     psa_export_key() lets us read back the derived key for off-line zeroize.
+        size_t exported_len = 0;
+        s = psa_export_key(s_hmac_key_ids[peer],
+                           s_hmac_key_arena[peer], 32, &exported_len);
+        if (s != PSA_SUCCESS || exported_len != 32) {
+            ESP_LOGE(TAG, "psa_export_key(HMAC) failed for peer %d: %d", peer, (int)s);
+            psa_destroy_key(s_hmac_key_ids[peer]);
+            s_hmac_key_ids[peer] = 0;
+            mbedtls_platform_zeroize(s_hmac_key_arena[peer], 32);
+            continue;
+        }
+
+        // (d) Zeroize sensitive scratch on the stack (we never had `shared` or `hmac_key`
+        //     locals — the derivation stayed inside PSA the whole time).
+        mbedtls_platform_zeroize(s_hmac_key_arena[peer], 32);   // optional, defensive
     }
 }
 ```
@@ -299,7 +305,7 @@ MAC input (common-header-first; concatenated, no length prefix):
   view      : u32  (4 bytes, little-endian)
   sequence  : u64  (8 bytes, little-endian)
   digest    : 32 bytes (SHA-256 of TX payload, or all-zeros for non-TX msgs)
-  payload   : variable (0-256 bytes, TX payload for Pre-Prepare; empty otherwise)
+  payload   : variable (0-PBFT_TX_PAYLOAD_MAX bytes, TX payload for Pre-Prepare; empty otherwise)
 ────────────────────────────────────────────────────────────
   Total     : 48 bytes minimum (common_header+view+seq+digest)
 ```
@@ -334,7 +340,9 @@ esp_err_t pbft_compute_mac(uint8_t peer_id,
                              const uint8_t digest[32],
                              const uint8_t* payload, size_t payload_len,
                              uint8_t mac_out[32]) {
-    uint8_t buf[48 + 256];   // stack, bounded (4 hdr + 4 view + 8 seq + 32 digest + payload)
+    // 304 B stack for MAC input — acceptable for the consensus task stack budget
+    // (8 KB). If budget tightens, switch to a static scratch arena.
+    uint8_t buf[48 + PBFT_TX_PAYLOAD_MAX];   // stack, bounded (4 hdr + 4 view + 8 seq + 32 digest + payload)
     size_t off = 0;
 
     // Write common_header: msg_type ‖ sender_id ‖ proto_version ‖ reserved (4 bytes, FIRST)
@@ -350,7 +358,7 @@ esp_err_t pbft_compute_mac(uint8_t peer_id,
     memcpy(buf + off, digest, 32); off += 32;
     // Write payload (if any)
     if (payload && payload_len > 0) {
-        if (payload_len > 256) return ESP_ERR_INVALID_ARG;
+        if (payload_len > PBFT_TX_PAYLOAD_MAX) return ESP_ERR_INVALID_ARG;
         memcpy(buf + off, payload, payload_len);
         off += payload_len;
     }

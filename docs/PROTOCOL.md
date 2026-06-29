@@ -404,7 +404,9 @@ Sent when replica suspects primary is faulty.
    {prepared_entry: n_prepared × (8 + 32)} | mac (32)
 
    Empty prepared-set: 4 + 4 + 4 + 8 + 32 + 1 + 3 + 32 = 88 bytes
-   Worst case (n_prepared=100): 88 + 100 × 40 = 4088 bytes → UDP only
+   Worst case (n_prepared=PBFT_VC_MAX_PREPARED=4): 88 + 4 × 40 = 248 bytes → fits ESP-NOW 250 B (H2 fix)
+   Note: PBFT_VC_MAX_PREPARED is range-capped at 4 (Kconfig); if a future
+   revision increases the cap, the MEMORY.md static_assert will fail at build time.
 ```
 
 | Field | Size | Notes |

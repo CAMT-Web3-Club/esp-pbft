@@ -672,7 +672,7 @@ New primary crashes mid-view-change. The `viewchange_timeout_ms` fires on all re
 | Item | Static size | Notes |
 |------|-------------|-------|
 | `pbft_view_state_t` | ~120 B | single instance |
-| `vc_set_arena[7]` (each VC slot) | 7 × max_vc_size | max ≈ 4088 B per VC → 28 KB if worst case; in practice VCs have ≤ 4 prepared → 7 × 248 = 1.7 KB |
+| `vc_set_arena[7]` (each VC slot) | 7 × 248 B = 1.7 KB | PBFT_VC_MAX_PREPARED=4 (H2 fix); in practice all slots are ≤ 248 B. Historical upper bound of 4088 B is unreachable with the current Kconfig range cap. |
 | Practical static cost | ~1.8 KB | aligns with HANDOVER §3.7 "View-change state ~1 KB" + a few hundred B slack |
 | View-Change wire (typical) | 88 + n_prepared × 40 B | n_prepared ≈ 0-4 → 88-248 B (fits ESP-NOW 250 B) |
 | View-Change wire (worst) | 248 B | n_prepared = 4 (= PBFT_VC_MAX_PREPARED); fits ESP-NOW |

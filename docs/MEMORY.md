@@ -535,6 +535,9 @@ _Static_assert(sizeof(pbft_view_change_t) <= 250,
                "View-Change worst case exceeds ESP-NOW 250 B — "
                "either reduce PBFT_VC_MAX_PREPARED or select "
                "CONFIG_PBFT_TRANSPORT_WIFI_UDP=y (compile-time only, no runtime fallback)");
+// Hard cap on n_prepared — if anyone bumps this above 4, the static_assert above
+// will fail (sizeof grows beyond 250 B). The Kconfig 'range 0 4' in PROTOCOL §6.5
+// is the soft cap; this is the hard build-time guard.
 // New-View (~5.9 KB worst case) NEVER fits in ESP-NOW. If ESP-NOW is
 // selected, view-change is impossible and the cluster is stuck on view 0.
 // This is by design (user requirement: no runtime fallback). To enable

@@ -314,19 +314,26 @@ See [MEMORY.md](./MEMORY.md) for the detailed per-module layout, `static_assert`
 → 1 TPS sustained → **~40 days** (POWER.md §4.5)
 → Lighter workload: see POWER.md §4.4 for the full model
 
-|
+**Wi-Fi UDP build (re-budgeted — see POWER.md §12.6):**
 
 | Mode | Current | Time/Day | Energy/Day |
 |------|---------|----------|------------|
-| Active (consensus) | see POWER.md §12.6 | derived (workload-model) | see POWER.md §12.6 |
-| Light sleep | 0.13 mA (130 µA datasheet typ) | per POWER.md §4.2 | derived |
-| **Total** | ~7.96 mA avg | — | **~191 mAh/day** (from POWER.md §4.4) |
+| Active (consensus) | 80 mA | 2.35 h (9.8% duty) | 188 mAh |
+| Modem-sleep (DFS ON) | 11.35 mA avg | 0 | 0 |
+| Light sleep | 0.13 mA | 21.65 h | 2.8 mAh |
+| **Total** | ~7.96 mA avg | — | **~191 mAh/day** (from POWER.md §4.5) |
 
 → 1000 mAh battery → **~5 days battery life** at 14 TPS sustained (light-sleep on)
 → 1 TPS sustained → **~40 days** (POWER.md §4.5)
-→ Lighter workload: see POWER.md §4.4 for the full model
+→ Lighter workload: see POWER.md §4.5 for the full model
 
-|
+> **Why two tables with the same numbers?** At 14 TPS sustained under light-sleep,
+> both transports converge to ~7.96 mA avg because the active TX duty is identical
+> (80 mA for ~9.8% of the day) and idle dominates. The transports differ in:
+> (a) peak current during association (UDP first packet ~160 mA vs ESP-NOW ~80 mA),
+> (b) max payload per message (UDP ~1472 B vs ESP-NOW 250 B), and
+> (c) network setup complexity (UDP needs AP association; ESP-NOW is point-to-point).
+> See POWER.md §3 for the comparison and §4.5 for the corrected budget.
 
 ---
 
