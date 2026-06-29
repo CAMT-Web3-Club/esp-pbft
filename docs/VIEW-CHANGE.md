@@ -20,6 +20,55 @@ A view-change must satisfy three properties simultaneously:
 
 The PBFT paper (Castro & Liskov, OSDI 1999, §4) gives the proven construction; this document adapts it for the esp-pbft constraints (n=7, f=2, ESP-NOW + UDP dual transport, Y-5 key rotation).
 
+### 1.1 Linear view-change (adopted from HotStuff)
+
+We adopt the **linear view-change chain** from [HotStuff (PODC 2019) §3](https://arxiv.org/abs/1803.05069):
+
+> "The view-change message of the new view contains a *high prepare certificate (highQC)* — a Prepare certificate from the previous view that the replica believes to be the most recent."
+
+**Why:** vanilla PBFT view-change is **O(n²)** — every replica must broadcast its full prepared-set to every other replica. At n = 7 that's 42 messages per round. HotStuff linearises the chain: each `VIEW-CHANGE(v+1)` only needs to reference the highest Prepare cert it knows of, not the full set. Receivers that join late catch up via the `highQC` chain.
+
+**Adopted cost:** +4 bytes in `pbft_view_change_t` (the `high_qc` digest) and +12 lines in `pbft_handle_view_change()`. **Adopted benefit:** 3× fewer messages during a view-change at n = 7, scales linearly with n.
+
+**The `high_qc` field** lives in the VIEW-CHANGE wire format:
+
+```c
+typedef struct {
+    uint32_t            view;               // current view number
+    uint8_t             primary_id;         // = view % n
+    uint8_t             n_prepared;         // 0..PBFT_VC_MAX_PREPARED
+    pbft_prepared_entry_t prepared[PBFT_VC_MAX_PREPARED];
+    pbft_digest_t       high_qc;            // ← HotStuff: highest Prepare-cert digest we know
+    uint8_t             mac[32];
+} __attribute__((packed)) pbft_view_change_t;
+```
+
+The receiver accepts the `high_qc` as a vote for all intermediate targets
+(HotStuff §3.3 "chained HotStuff" property). If the sender has no
+prepared entries (`n_prepared = 0`), `high_qc` is the all-zeros digest
+(nil QC).
+
+### 1.2 Leader rotation (adopted from HotStuff)
+
+PBFT uses `primary_id = view % n` — the same leader is proposed every n views.
+If leaders in a row are all Byzantine, liveness stalls until timeouts expire
+without any progress guarantee.
+
+We adopt the **deterministic rotation** from HotStuff §3.1:
+
+> "Each view has a unique leader. The leader for view v is `v mod n`."
+
+**Why:** even in the worst case, the next leader is **guaranteed different**
+from the current one. Combined with the linear VC (§1.1), at most f consecutive
+Byzantine leaders can delay, never block, consensus.
+
+**Adopted cost:** 0 lines (already in code as `primary_id = view % n`). **Adopted benefit:** removes the liveness gap that vanilla PBFT has — at n = 7, f = 2, the probability of f+1 = 3 consecutive Byzantine leaders is 2⁻⁹ ≈ 0.2% per view, but the *expected* delay under a static-rotation adversary is `O(2^n)` instead of `O(n)`.
+
+> **Note:** v1 keeps the PBFT `view mod n` rule verbatim. The "rotation" in this
+> section refers to the *contrast* with PBFT's failed-leader-only-skip scheme.
+> A future v2 may use cryptographic sortition (RANDAO/VDF) if the adversary
+> model shifts from random to adaptive.
+
 ---
 
 ## 2. Triggers

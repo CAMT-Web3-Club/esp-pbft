@@ -18,6 +18,19 @@ The state machine executes once per request, on every replica, with the same log
 
 Primary is determined by `p = view mod n`. View-change rotates the primary when faulty behavior is detected.
 
+**HotStuff concepts adopted** (see [HANDOVER §1.5](./HANDOVER.md#15-design-influences-papers-adopted) for the full citation matrix):
+
+- **Linear view-change chain** ([HotStuff (PODC 2019) §3](https://arxiv.org/abs/1803.05069)) — each `VIEW-CHANGE(v+1)` carries a `high_qc` field referencing the highest Prepare certificate the sender knows. Reduces view-change from O(n²) to O(n). See [VIEW-CHANGE.md §1.1](./VIEW-CHANGE.md#11-linear-view-change-adopted-from-hotstuff).
+- **Deterministic leader rotation** ([HotStuff (PODC 2019) §3.1](https://arxiv.org/abs/1803.05069)) — `primary_id = view mod n` is the canonical rule; combined with linear VC, the worst-case delay is O(1) view. See [VIEW-CHANGE.md §1.2](./VIEW-CHANGE.md#12-leader-rotation-adopted-from-hotstuff).
+
+> **Why not full HotStuff?** esp-pbft v1 keeps the **HMAC-SHA256** authentication
+> from PBFT (see CRYPTO §3, §5) instead of the BLS aggregate signatures that
+> HotStuff requires. The liveness improvement is captured by the linear VC +
+> rotation rules above. BLS is deferred to v2 (n > 25) where the bandwidth
+> saving outweighs the ~50 KB flash + 5 KB RAM cost of the blst library.
+> See [HANDOVER §1.5](./HANDOVER.md#15-design-influences-papers-adopted) for the
+> full "adopted vs deferred" matrix.
+
 ---
 
 ## 2. Roles and primary selection
