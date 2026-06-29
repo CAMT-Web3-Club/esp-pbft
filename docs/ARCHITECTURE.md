@@ -487,32 +487,47 @@ These are higher-level than the HANDOVER.md open questions:
 | **Easier safety review** | All memory visible at compile time |
 | **Better for OTA** | Memory layout stable across versions |
 
-### 11.2 Static allocation inventory
+### 11.2 Static allocation inventory — 4-region layout (TinyBFT §VI-A)
 
-| Data structure | Size | Where | Lifetime |
-|----------------|------|-------|----------|
-| `pbft_config_t` (active config) | ~100 B | BSS | Permanent |
-| ECDSA private key (current boot) | 32 B | BSS | RAM, regenerated on Y-5 |
-| ECDSA public key (own) | 65 B (0x04 ‖ X_BE ‖ Y_BE, uncompressed P-256) | BSS | RAM, regenerated on Y-5 |
-| Peer pubkey cache (7 slots × 65 B) | 7 × 65 B = 455 B | BSS | Permanent (TOFU) |
-| HMAC keys (7 slots × 32 B) | 7 × 32 B = 224 B | BSS | RAM, regenerated on Y-5 |
-| Pending TX / PBFT log (100 entries × ~360 B) | ~36 KB | BSS | Until checkpoint GC |
-| V-set arena (7 × 248 B) | ~1.7 KB | BSS | Per-view (PBFT_VC_MAX_PREPARED=4 after H2 fix) |
-| Checkpoint proof table | ~640 B | BSS | Permanent |
-| Dedup / executed-digest cache (256 × 40 B) | ~10 KB | BSS | Permanent (FIFO) |
-| Network TX buffer | 4 KB | BSS | Permanent |
-| Network RX buffer | 4 KB | BSS | Permanent |
-| RX arena (parse, 2 concurrent) | 8 KB | BSS | Permanent |
-| TX queue (ISR submit) | ~4.5 KB | BSS | Permanent |
-| PSA crypto contexts (ECDSA, ECDH, HMAC) | ~3 KB | BSS | Permanent |
-| Metrics counters | ~200 B | BSS | Permanent |
-| **Total static (esp-pbft source)** | **~72 KB** | **BSS** | — |
+esp-pbft organizes all static state into **4 regions** by lifetime, inspired by
+[TinyBFT §VI-A](https://doi.org/10.1109/RTAS61025.2024.00026). This separation:
 
-> Arrays are sized `[7]` to the cluster size (self slot included/unused); 6 peers are
-> actually used. **Grand total ~117 KB** (lwIP excluded) including the ESP-IDF /
-> FreeRTOS / PSA library footprint — see [MEMORY.md](./MEMORY.md) §3 for the full
-> breakdown. esp-pbft source contains **zero `malloc`**; PSA crypto and FreeRTOS
-> allocate internally (§11.5).
+- Makes memory budget explicit per region (each fits a `static_assert`)
+- Enables selective NVM migration in v2 (Agreement+Checkpoint → SPI Flash)
+- Simplifies static analysis (lifetime-based reasoning)
+
+| Region | Data | Size | Lifetime | Default | v2 NVM? |
+|--------|------|------|----------|---------|---------|
+| **1. Agreement** | `pbft_log[]` (100 entries × ~360 B) | **~36 KB** | Per-view, GC at checkpoint | BSS | SPI Flash |
+| | V-set arena (7 × 248 B) | ~1.7 KB | Per-view-change | BSS | SPI Flash |
+| **2. Checkpoint** | Checkpoint proof table | ~640 B | Stable (new = discard old) | BSS | SPI Flash |
+| | State digests (K+1 entries) | ~256 B | Stable | BSS | SPI Flash |
+| **3. Event** | New-View inbox (1 slot) | ~1.3 KB | One-shot per view-change | BSS | RAM |
+| | Catch-up request inbox (7 slots) | ~560 B | One-shot per peer | BSS | RAM |
+| | Catch-up response inbox (7 slots) | ~1.4 KB | One-shot per peer | BSS | RAM |
+| **4. Scratch** | MAC input buffer (48 + 256 B) | **304 B** | Reused per message | **BSS** (was stack) | RAM |
+| | Network TX/RX arena | 8 KB | Reused per send/recv | BSS | RAM |
+| | TX queue (ISR submit) | ~4.5 KB | Reusable ring | BSS | RAM |
+| **Cross-region** | `pbft_config_t` (active config) | ~100 B | Permanent | BSS | RAM |
+| | ECDSA private key (current boot) | 32 B | RAM, regenerated on Y-5 | BSS | RAM |
+| | ECDSA public key (own) | 65 B | RAM, regenerated on Y-5 | BSS | RAM |
+| | Peer pubkey cache (7 × 65 B) | 455 B | Permanent (TOFU) | BSS | RAM |
+| | HMAC keys (7 × 32 B) | 224 B | RAM, regenerated on Y-5 | BSS | RAM |
+| | Dedup / executed-digest cache (256 × 40 B) | ~10 KB | Permanent (FIFO) | BSS | RAM |
+| | PSA crypto contexts (ECDSA, ECDH, HMAC) | ~3 KB | Permanent | BSS | RAM |
+| | Metrics counters | ~200 B | Permanent | BSS | RAM |
+| | **Total static (esp-pbft source)** | **~72 KB** | **BSS** | — | BSS | mixed |
+
+Arrays are sized `[7]` to the cluster size (self slot included/unused); 6 peers are
+actually used. **Grand total ~117 KB** (lwIP excluded) including the ESP-IDF /
+FreeRTOS / PSA library footprint — see [MEMORY.md](./MEMORY.md) §3 for the full
+breakdown. esp-pbft source contains **zero `malloc`**; PSA crypto and FreeRTOS
+allocate internally (§11.5).
+
+> **Why Scratch moved to BSS (Q2 fix)?** A 304 B stack array + 4 KB TX buffer + 1.3 KB
+> New-View + etc. on the call stack = real risk of overflow on the 8 KB FreeRTOS
+> task stack. The Scratch region is shared (one writer at a time per task) and
+> zeroed between uses, so BSS is the right home.
 
 ### 11.3 Compile-time bounds checking
 
@@ -602,6 +617,44 @@ Every PR must confirm:
 
 See [MEMORY.md](./MEMORY.md) (when written) for detailed per-module memory layout.
 
+### 11.10 4-region per-region static_assert
+
+Each region has its own compile-time bound check, so a config regression that
+bloats one region will fail the build with a clear message rather than silently
+overflowing RAM at runtime. Adopted from TinyBFT §VI-D.
+
+```c
+// 1. Agreement region (per-view, GC'd at checkpoint)
+_Static_assert(sizeof(s_agreement) <= 40 * 1024,
+               "Agreement region exceeds 40 KB budget — adjust PBFT_LOG_MAX_ENTRIES");
+_Static_assert(sizeof(s_vc_set_arena) <= 2 * 1024,
+               "VC arena exceeds 2 KB budget");
+
+// 2. Checkpoint region (stable)
+_Static_assert(sizeof(s_checkpoint) <= 1 * 1024,
+               "Checkpoint region exceeds 1 KB budget — adjust K+1");
+
+// 3. Event region (one-shot)
+_Static_assert(sizeof(s_event) <= 4 * 1024,
+               "Event region exceeds 4 KB budget — adjust inbox sizes");
+
+// 4. Scratch region (reusable; was stack in CRYPTO.md §5.2)
+_Static_assert(sizeof(s_scratch) <= 16 * 1024,
+               "Scratch region exceeds 16 KB budget — risk of NVM round-trip latency");
+
+// Grand total
+_Static_assert(sizeof(s_esp_pbft) <= 80 * 1024,
+               "esp-pbft BSS exceeds 80 KB — incompatible with ESP32-C3 400 KB RAM");
+```
+
+> **Why per-region asserts?** A single `static_assert(sizeof(s_esp_pbft) <= 80 KB)`
+> only fires after multiple regions bloated at once. Per-region asserts localize
+> the regression to the offending code, which speeds review and prevents the
+> budget from drifting silently across releases. Re-baseline the budgets only
+> with a deliberate `MEMORY.md` §3 update + commit message explaining the
+> increase (e.g. "Bump Agreement region from 40 KB to 48 KB to support 8-node
+> cluster; corresponding HANDOVER §3.7 total updated to ~80 KB").
+
 ---
 
-**End of ARCHITECTURE.md (v0.2 draft — static memory discipline added)**
+**End of ARCHITECTURE.md (v0.3 draft — 4-region layout from TinyBFT §VI-A added)**

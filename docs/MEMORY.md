@@ -18,6 +18,26 @@ Heap usage from PSA crypto, FreeRTOS, and ESP-IDF components (ESP-NOW, Wi-Fi) is
 
 ## 2. Per-module layout
 
+### 2.0 4-region organization (TinyBFT §VI-A)
+
+esp-pbft groups the per-module items below into **4 regions by lifetime**,
+matching the structure in [ARCHITECTURE.md §11.2](./ARCHITECTURE.md#112-static-allocation-inventory--4-region-layout-tinybft-vi-a):
+
+| Region | Items (see §2.x below) | v1 (BSS) | v2 (NVM) | Budget (static_assert) |
+|--------|------------------------|---------|----------|-----------------------|
+| **1. Agreement** | §2.3 (PBFT log), §2.5 (V-set) | 36 + 1.7 KB | SPI Flash | ≤ 40 KB |
+| **2. Checkpoint** | §2.6 (proofs), §2.7 (watermarks) | 640 + 50 B | SPI Flash | ≤ 1 KB |
+| **3. Event** | §2.13 (TX queue inbox for New-View) | ~4.5 KB | RAM | ≤ 4 KB |
+| **4. Scratch** | §2.8 (network buffers, MAC input) | 8 KB + 304 B | RAM | ≤ 16 KB |
+| **Cross-region** | §2.1-2.4, §2.9-2.12, §2.14 | ~20 KB | RAM | n/a |
+
+> **Why this matters for v2:** When the cluster grows beyond n=7 (the v1 design point),
+> the **Agreement** and **Checkpoint** regions can be offloaded to SPI Flash
+> (TinyBFT §VI-C — "scratch region stays in internal RAM; bulk storage moves
+> to NVM"). The per-region `static_assert` (ARCHITECTURE §11.10) still fires
+> on the *internal-RAM* size, so a config regression that bloats scratch
+> will fail the build even after the agreement region is externalised.
+
 ### 2.1 `pbft_config_t` (active configuration)
 
 ```c
@@ -45,7 +65,7 @@ static pbft_config_t s_config;     // ~120 B
 static pbft_node_desc_t s_cluster_members[7];   // 7 × ~16 B = ~112 B
 ```
 
-### 2.3 PBFT log (resolves audit A5 — inline payload)
+### 2.3 PBFT log (resolves audit A5 — inline payload) — **Agreement region**
 
 ```c
 static pbft_log_entry_t s_log[PBFT_LOG_MAX_ENTRIES];   // 100 × ~360 B = ~36 KB
@@ -129,7 +149,7 @@ typedef struct {
 } pbft_view_state_t;
 ```
 
-### 2.5 V-set arena (VIEW-CHANGE.md §4.1)
+### 2.5 V-set arena (VIEW-CHANGE.md §4.1) — **Agreement region**
 
 ```c
 static pbft_view_change_t s_vc_set_arena[7];   // 7 × 248 B = ~1.7 KB
@@ -147,7 +167,7 @@ slot size = 88 + 4 × 40 = 248 B  // ≤ ESP-NOW 250 B
 > `CONFIG_PBFT_TRANSPORT_WIFI_UDP=y` AND use New-View over UDP. View-Change still fits ESP-NOW
 > in the default config.
 
-### 2.6 Checkpoint proof table (CHECKPOINT.md §5.3)
+### 2.6 Checkpoint proof table (CHECKPOINT.md §5.3) — **Checkpoint region**
 
 ```c
 static pbft_checkpoint_proof_t s_checkpoint_proofs[8];   // 8 × ~80 B = ~640 B
@@ -168,7 +188,7 @@ typedef struct {
 
 Eight slots support one in-flight checkpoint proof per node plus headroom.
 
-### 2.7 Watermark state
+### 2.7 Watermark state — **Checkpoint region**
 
 ```c
 static pbft_watermark_state_t s_watermarks;   // ~50 B
@@ -178,7 +198,7 @@ static pbft_watermark_state_t s_watermarks;   // ~50 B
 and `high_watermark`. `pbft_view_state_t` (§2.4) MUST NOT duplicate these fields.
 `high_watermark = low_watermark + PBFT_LOG_MAX_ENTRIES` (CHECKPOINT.md §4 is canonical).
 
-### 2.8 Network buffers
+### 2.8 Network buffers — **Scratch region**
 
 ```c
 static uint8_t s_tx_buffer[4096];           // 4 KB
@@ -226,7 +246,7 @@ Already covered in §2.9 as `s_peer_pub_arena`.
 static pbft_metrics_t s_metrics;   // ~120 B
 ```
 
-### 2.13 Pending-TX queue (for `pbft_submit_from_isr`)
+### 2.13 Pending-TX queue (for `pbft_submit_from_isr`) — **Event region**
 
 ```c
 static pbft_tx_queue_entry_t s_tx_queue[16];   // 16 × ~280 B = ~4.5 KB
