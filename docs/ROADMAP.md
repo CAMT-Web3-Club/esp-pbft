@@ -220,6 +220,11 @@ Tag v1.0, run final 24-hour soak test, publish release artifacts.
 - [ ] 24-hour soak passes (heap stable, all TXs committed, no view-change loops)
 - [ ] CHANGELOG.md complete
 - [ ] Component listed on `components.espressif.com`
+- [ ] **External security review gate (AUDIT-FIX IR-8, 2026-06-29):**
+  - [ ] 1 consultant-week external review of CRYPTO.md, FAILURE-MODES.md, DEPLOYMENT.md
+  - [ ] Zero P0 (protocol-breaking) findings open at v1.0.0 tag
+  - [ ] OR all P0 findings resolved before tag (each with a regression test)
+  - [ ] P1 (security hardening) findings documented in `docs/v1.0.0-security.md`
 - [ ] v1.0.0 tag pushed
 
 ---

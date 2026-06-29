@@ -31,6 +31,15 @@ The header is the only file applications need to include. Internal headers (`pbf
 ### 2.1 `pbft_config_t`
 
 ```c
+// Typedef for the optional log callback. AUDIT-FIX IR-4 (2026-06-29): this
+// typedef was previously MISSING from the docs; API-REFERENCE §2.1 referenced
+// `pbft_log_fn` without defining it. Application code needs this to compile.
+typedef void (*pbft_log_fn)(int level, const char* msg);
+
+// Typedef for the optional state-digest callback (CHECKPOINT.md). Surfaced
+// here because API-REFERENCE is the canonical reference for the public C API.
+typedef void (*pbft_state_digest_fn)(uint64_t sequence, uint8_t out_digest[32]);
+
 typedef struct {
     uint8_t  my_node_id;                     // 0..6 (PBFT_CLUSTER_SIZE-1)
     uint8_t  cluster_size;                   // must be 7 (compile-time constant)
@@ -65,10 +74,30 @@ esp_err_t pbft_deinit(void);
 
 | Function | Contract |
 |----------|----------|
-| `pbft_init` | Validates `config`. Generates TRNG keypair. Stores config in BSS. Returns `ESP_OK` or one of [§3 error codes]. Idempotent (subsequent calls return `PBFT_ERR_ALREADY_INITIALIZED`). |
+| `pbft_init` | Validates `config` per the table below (AUDIT-FIX IR-4 — was previously hand-waved as "Validates config" with no per-field rules). Generates TRNG keypair. Stores config in BSS. Returns `ESP_OK` or one of [§3 error codes]. Idempotent (subsequent calls return `PBFT_ERR_ALREADY_INITIALIZED`). |
 | `pbft_start` | Begins Pattern Y handshake (Hello broadcast + ECDH with peers). Blocks for up to 5 s for Hello exchange. Returns `ESP_OK` once at least `PBFT_QUORUM - 1 = 4` peer Hellos received, OR `PBFT_ERR_HANDSHAKE_TIMEOUT` after 5 s. After timeout, retries once; persistent failure returns `PBFT_ERR_NO_PEERS`. |
 | `pbft_stop` | Graceful shutdown: cancels timers, deregisters ESP-NOW callbacks, does NOT destroy keys (so re-start doesn't trigger re-handshake). Idempotent. |
 | `pbft_deinit` | Destroys keys, zeros RAM, releases ESP-NOW peers. Idempotent. After `pbft_deinit`, must call `pbft_init` again before `pbft_start`. |
+
+**`pbft_init` validation rules (AUDIT-FIX IR-4, 2026-06-29):**
+
+| Field | Rule on init | Behaviour on violation |
+|-------|--------------|-------------------------|
+| `my_node_id` | `0 <= my_node_id < PBFT_CLUSTER_SIZE` (= 7) | Return `PBFT_ERR_INVALID_ARG` |
+| `cluster_size` | MUST equal `PBFT_CLUSTER_SIZE` (= 7) | Return `PBFT_ERR_INVALID_ARG` (strict; not silently coerced) |
+| `cluster_members` | non-NULL; each entry's `node_id` matches its array index AND is unique AND 0..6 | Return `PBFT_ERR_INVALID_ARG` |
+| `prepare_timeout_ms` | `> 0` AND `<= 60000` | Return `PBFT_ERR_INVALID_ARG` |
+| `commit_timeout_ms` | `> 0` AND `<= 60000` | Return `PBFT_ERR_INVALID_ARG` |
+| `viewchange_timeout_ms` | `> 0` AND `<= 60000`; recommended ≥ `2 × (prepare + commit)` to give the new primary a fair window | Return `PBFT_ERR_INVALID_ARG` |
+| `payload_max` | `1..PBFT_TX_PAYLOAD_MAX` (= 256); if zero, default to `PBFT_TX_PAYLOAD_MAX` | Return `PBFT_ERR_INVALID_ARG` if out of range |
+| `state_digest_cb` | nullable (NULL = all-zero digests, no app state to commit) | Always OK |
+| `log_cb` | nullable (NULL = silent); if non-NULL, calls `log_cb(level, msg)` from PBFT task | Always OK |
+
+**Default behaviour on zero-initialised `pbft_config_t`:** if `cfg` is
+zero-initialised (BSS), the validator above returns `PBFT_ERR_INVALID_ARG`
+on the first field with a zero value (likely `cluster_size` or
+`prepare_timeout_ms`). The `pbft_init` call MUST fail loudly; a silent
+fallback would mask misconfiguration.
 
 ---
 
@@ -139,6 +168,23 @@ typedef struct {
     uint64_t       sequence;      // OUT only — assigned by primary
     uint32_t       flags;         // IN — see below
 } pbft_tx_t;
+```
+
+**AUDIT-FIX IR-3 (2026-06-29) — payload lifetime contract:**
+
+- The caller OWNS `payload` (the buffer pointed to by `tx->payload`).
+- `payload` MUST remain valid **at least until the corresponding commit
+  callback fires** (or `pbft_submit` returns an error). The commit callback
+  delivers a `pbft_tx_t` whose `payload` pointer refers to memory inside
+  the PBFT log entry, valid for the duration of the callback only; if the
+  app needs the bytes beyond that, copy them in the callback.
+- The typical "submit → callback" latency is 30–100 ms (3-phase PBFT over
+  ESP-NOW) but can be longer under load or view-change. Apps must NOT
+  free / reuse the payload buffer until either the callback fires OR
+  `pbft_submit` returns a hard error.
+- Calling `pbft_submit` with a stack-allocated payload that goes out of
+  scope before the commit is a **silent use-after-free** — the callback
+  will read freed memory.
 
 // Flag bits:
 #define PBFT_TX_FLAG_NONE      0x00
@@ -370,7 +416,35 @@ pbft_metrics_t pbft_get_metrics(void);
 void           pbft_reset_metrics(void);
 ```
 
-`pbft_get_metrics` returns a snapshot (atomic read of BSS struct). `pbft_reset_metrics` zeros the counters; thread-safe.
+`pbft_get_metrics` returns a **coherent snapshot** of the metric counters.
+`pbft_reset_metrics` zeros the counters; thread-safe.
+
+**AUDIT-FIX IR-3 (2026-06-29) — atomicity contract:**
+
+The previous "atomic read of BSS struct" hand-wave is not implementable on
+RISC-V / ESP32-C3 without `_Atomic` types or a snapshot critical section.
+esp-pbft v1 uses the **snapshot critical section** approach:
+
+```c
+pbft_metrics_t pbft_get_metrics(void) {
+    pbft_metrics_t snap;
+    // Snapshot all counters in a single critical section. With
+    // CONFIG_PBFT_MULTI_TASK_API=y this is the `pbft_api_mutex`; with
+    // CONFIG_PBFT_MULTI_TASK_API=n the PBFT task is the only writer so a
+    // short taskENTER_CRITICAL is sufficient.
+    taskENTER_CRITICAL();
+    snap = s_metrics;     // plain memcpy of the struct
+    taskEXIT_CRITICAL();
+    return snap;
+}
+```
+
+This guarantees the returned snapshot has no torn reads even with concurrent
+writers (e.g., `pbft_submit_from_isr` incrementing `tx_submitted` while the
+app calls `pbft_get_metrics`). The alternative — annotating each `uint64_t`
+as `_Atomic` and reading with `atomic_load_explicit(..., memory_order_relaxed)`
+— would also work but is not used in v1 (slightly more code; equivalent
+correctness for this single-producer-snapshot pattern).
 
 ---
 
@@ -527,6 +601,7 @@ These functions are referenced throughout CONSENSUS.md, VIEW-CHANGE.md, and CHEC
 // pbft_log.h
 pbft_log_entry_t* pbft_log_get_or_create(uint32_t view, uint64_t sequence);
 pbft_log_entry_t* pbft_log_find(uint32_t view, uint64_t sequence);
+pbft_log_entry_t* pbft_log_find_by_seq(uint64_t sequence);   // AUDIT-FIX VC-3 (2026-06-29)
 void              pbft_log_free(pbft_log_entry_t* entry);
 bool              pbft_log_full(void);
 ```

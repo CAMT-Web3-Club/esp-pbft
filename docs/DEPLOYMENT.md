@@ -60,6 +60,15 @@ pbft,high_wm,u64,0000000000000064
 pbft,log_size_max,u16,0064
 pbft,payload_max,u16,0100
 pbft,transport,u8,00
+# AUDIT-FIX SEC-Y-10 (2026-06-29): factory identity anchor (eFuse-derived).
+# Each device burns a random 256-bit value into eFuse BLOCK_KEY1 at provisioning
+# (via `esp_efuse_write_key(EFUSE_BLK_KEY1, ...)` or via espefuse.py). At boot
+# the cluster reads `pbft,hw_id` and verifies that all 7 nodes' hw_ids are
+# distinct — a duplicate triggers an alarm. The hw_id is RAM-only and does
+# NOT leave the chip, but every node logs it (first 8 bytes only) so an
+# operator can verify uniqueness at deployment. This catches the supply-chain
+# replacement attack class that pure TRNG + TOFU permits (CRYPTO §10.4).
+pbft,hw_id,hex2bin,0000000000000000000000000000000000000000000000000000000000000000   # overwritten per device
 
 # pbft_cluster namespace (MAC addresses for all 7 nodes)
 pbft_cluster,cluster_size,u8,07
@@ -152,6 +161,18 @@ If the customer wants custom MACs (e.g., for regulatory or branding reasons), us
 ### 3.1 Physical-security requirement (audit C7 fix)
 
 **Critical assumption:** during initial boot, **all 7 nodes must be in physical proximity and on the same RF channel**. This is required because Pattern Y uses TOFU (Trust On First Use) — the first Hello from each `node_id` is trusted. An attacker on the same channel could otherwise substitute a pubkey.
+
+> **AUDIT-FIX SEC-Y-10 (2026-06-29):** TOFU alone is necessary but NOT sufficient.
+> Even with full physical security of the RF channel, an attacker who **physically
+> swaps one of the 7 boards** for a flash-cloned board with attacker-chosen keys
+> can produce an indistinguishable replacement. TRNG generates fresh nonces
+> every boot, so the attacker controls the new identity completely.
+>
+> **Defense (v1, optional):** burn a random 256-bit value into eFuse `BLOCK_KEY1`
+> at provisioning (one-time; irreversible). Every boot reads it into the
+> `pbft,hw_id` NVS key. The cluster checks `hw_id` uniqueness across all 7
+> nodes and logs an alarm if any two collide. See §2.5 for the NVS layout
+> and §10.4 in CRYPTO.md for the threat-model context.
 
 Mitigations:
 

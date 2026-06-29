@@ -145,7 +145,9 @@ typedef struct {
     // NOTE: low/high watermark live in pbft_watermark_state_t (§2.7), NOT here —
     //       view_state must NOT duplicate them (single owner = pbft_watermark_state_t).
     uint8_t             vc_set_count;
-    uint8_t             vc_set_from[7];
+    // AUDIT-FIX VC-11 (2026-06-29): vc_set_view[7] (per-sender max new_view)
+    // replaces the old vc_set_from[7] bitmask. See VIEW-CHANGE §4.1.
+    uint32_t            vc_set_view[7];
     const pbft_view_change_t* vc_set[7];
     uint32_t            prepare_timeout_ms;
     uint32_t            commit_timeout_ms;

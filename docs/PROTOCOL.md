@@ -77,16 +77,29 @@ extern const pbft_transport_t* pbft_get_transport(void);  // returns &pbft_trans
 static pbft_transport_status_t espnow_init(const pbft_net_config_t* cfg) {
     esp_now_init();
     esp_now_register_send_cb(espnow_send_cb);
-    // Register all 6 peers as broadcast-capable
+    // AUDIT-FIX SEC-Y-13 (2026-06-29): enable per-peer CCMP encryption.
+    // The previous `.encrypt = false` disabled air-layer integrity so an
+    // attacker with a $5 ESP32 + 30 lines of Arduino could jam the channel
+    // or replay-storm the cluster (no MAC check at air layer). ESP-NOW CCMP
+    // (WPA2-PSK-style) is built-in for encrypted peers; ESP-NOW supports up
+    // to 20 encrypted peers — sufficient for n=7. The PTK is derived from a
+    // per-cluster pre-shared key (provisioned alongside `my_node_id`); the
+    // PMK is held in NVS.
+    //
+    // Broadcast still goes to FF:FF:FF:FF:FF:FF but with the air-layer MAC
+    // enabled. CCMP costs ~1 µs per packet (AES-CCM HW on ESP32-C3).
     for (int i = 0; i < PBFT_CLUSTER_SIZE; i++) {
         if (i == cfg->my_node_id) continue;
         esp_now_peer_info_t peer = {
             .peer_addr = PBFT_ESP_NOW_BROADCAST_MAC,   // all-FF
             .channel = 0,
-            .encrypt = false,  // HMAC at PBFT layer (ESP-NOW encryption disabled to keep v1 simple; CCMP disabled)
+            .encrypt = true,                              // AUDIT-FIX SEC-Y-13
+            .pmk = s_pmk,                                 // 16 B; loaded from NVS at boot
         };
         esp_now_add_peer(&peer);
     }
+    // Initialise per-source-MAC airtime rate limiter (§2.2a) and RSSI floor.
+    pbft_airtime_limiter_init();
     return PBFT_TX_OK;
 }
 
@@ -109,6 +122,76 @@ The `PBFT_ESP_NOW_BROADCAST_MAC` constant is defined in `pbft_network_espnow.h`:
 #define PBFT_UDP_MTU                 1500
 #define PBFT_UDP_MAX_PAYLOAD         1472
 ```
+
+### 2.2a Airtime rate-limiter + RSSI sanity check (AUDIT-FIX SEC-Y-13, 2026-06-29)
+
+Two RX-side guards against an attacker who holds airtime near the cluster.
+Even with CCMP enabled (which authenticates the air frame), an attacker
+can flood authenticated frames from a node whose PMK they have somehow
+obtained, or simply jam. The cluster must still make progress.
+
+```c
+// (1) Per-source-MAC sliding-window rate limiter.
+//     ESP-NOW headers carry the source MAC. PBFT worst-case legitimate
+//     rate at 14 TPS is ~3 frames per TX (Pre-Prepare + Prepare + Commit) ×
+//     6 senders = 18 frames per TX cycle, ≤ 30 frames/sec at peak. We set
+//     the cap to PBFT_AIRTIME_MAX_PER_SEC (default 50) — 1.7× the worst
+//     case, leaving headroom but blocking >50 frames/sec/sender which is
+//     unambiguously an attack.
+#define PBFT_AIRTIME_MAX_PER_SEC  50
+#define PBFT_AIRTIME_WINDOW_MS   1000
+
+static struct {
+    uint8_t  mac[6];
+    uint32_t window_start_ms;
+    uint16_t count;
+} s_airtime[7];
+
+void pbft_airtime_limiter_init(void) {
+    memset(s_airtime, 0, sizeof(s_airtime));
+}
+
+bool pbft_airtime_limiter_allow(const uint8_t src_mac[6]) {
+    uint32_t now = now_ms();
+    for (int i = 0; i < 7; i++) {
+        if (memcmp(s_airtime[i].mac, src_mac, 6) != 0) continue;
+        if (now - s_airtime[i].window_start_ms >= PBFT_AIRTIME_WINDOW_MS) {
+            s_airtime[i].window_start_ms = now;
+            s_airtime[i].count = 0;
+        }
+        if (s_airtime[i].count >= PBFT_AIRTIME_MAX_PER_SEC) return false;
+        s_airtime[i].count++;
+        return true;
+    }
+    // New source — register
+    int empty = -1;
+    for (int i = 0; i < 7; i++) if (s_airtime[i].mac[0] == 0) { empty = i; break; }
+    if (empty < 0) return true;   // table full — fail open (rare)
+    memcpy(s_airtime[empty].mac, src_mac, 6);
+    s_airtime[empty].window_start_ms = now;
+    s_airtime[empty].count = 1;
+    return true;
+}
+
+// (2) RSSI floor — reject frames whose signal is too weak to be from a
+//     cluster node. ESP-NOW exposes the RSSI of the last received frame
+//     via the RX callback. PBFT is intended for physically co-located nodes;
+//     -85 dBm is the floor for "same room" on a typical 2.4 GHz channel.
+//     Frames below the floor are dropped (counted, then discarded). This
+//     catches long-range replay attacks where an attacker captures a frame
+//     and rebroadcasts it from outside the cluster's physical perimeter.
+#define PBFT_RSSI_FLOOR_DBM  (-85)
+
+bool pbft_rssi_acceptable(int8_t rssi_dbm) {
+    return rssi_dbm >= PBFT_RSSI_FLOOR_DBM;
+}
+```
+
+**Wire-up:** in `pbft_network_dispatch()` (PROTOCOL §11), reject frames that
+fail either check before they reach the crypto/MAC verify path. Frames dropped
+here are counted in `pbft_metrics_t.mac_failures` (existing metric, the same
+counter is appropriate because the effect is the same from the consensus
+viewpoint: the frame is unusable).
 
 ### 2.3 Wi-Fi UDP implementation (`pbft_network_wifi_udp.c`)
 

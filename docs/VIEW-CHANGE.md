@@ -152,10 +152,18 @@ typedef struct {
     // NOTE: low_watermark and high_watermark live in pbft_watermark_state_t
     // (single-owner rule per MEMORY §2.4). Access them via pbft_watermark_get().
 
-    // V-set cache: VIEW-CHANGE messages received for the current view_change target
-    uint8_t             vc_set_count;           // 0..n-1
-    uint8_t             vc_set_from;            // single bitmask: bit i = VC received from node i (G19)
-    const pbft_view_change_t* vc_set[7];        // pointers into RX message arena
+    // V-set cache for the current view-change target.
+    // CHANGED (audit-fixes-2026-06-29): per-sender max-view array replaces the
+    // old vc_set_from bitmask. The bitmask was first-write-wins per sender,
+    // which silently lost higher-target cascade VCs from a node that had
+    // already escalated (only the first VC per sender counted). With cascading
+    // view-changes (§9.5) the maximum new_view reached per sender matters, not
+    // the first VC received. vc_set_view[s] stores the highest new_view seen
+    // from sender s; the V-set quorum check counts senders whose
+    // vc_set_view[s] >= current_target_view (see §5.1 step 3).
+    uint8_t             vc_set_count;           // count of distinct senders seen so far
+    uint32_t            vc_set_view[7];         // per-sender max new_view; 0 = no VC yet from s
+    const pbft_view_change_t* vc_set[7];        // pointer to the highest-target VC from each sender
 
     uint32_t            prepare_timeout_ms;     // default 1000
     uint32_t            commit_timeout_ms;      // default 1000
@@ -163,7 +171,7 @@ typedef struct {
 } pbft_view_state_t;
 ```
 
-`vc_set[]` points into the static RX arena — no heap. When the arena is overwritten by a new RX, the pointers must be considered stale; to avoid that, **copy each VC into a fixed slot in `vc_set_arena[7]`** (each slot ≈ 200 B; 7 × 200 = 1.4 KB).
+`vc_set[]` points into the static RX arena — no heap. When the arena is overwritten by a new RX, the pointers must be considered stale; to avoid that, **copy each VC into a fixed slot in `vc_set_arena[7]`** (each slot ≈ 248 B; 7 × 248 = 1.7 KB). When a higher-target VC arrives from a sender whose `vc_set_view[s]` is already set, the slot is overwritten with the newer VC and `vc_set_view[s]` is raised to the newer target. This is the **VC-11 bookkeeping fix** required for the §9.5 cascade rule to work.
 
 ### 4.2 Prepared-set entry
 
@@ -211,6 +219,34 @@ The MAC input is `view ‖ new_view ‖ checkpoint_seq ‖ checkpoint_digest ‖
 
 ### 4.4 New-View message (corrected format — fixes audit A2)
 
+**AUDIT-FIX IR-2 (2026-06-29):** the canonical packed C struct is the single
+source of truth for wire format. The wire diagram below matches the struct
+exactly; the static_assert catalog in [MEMORY.md §8](./MEMORY.md) needs concrete
+types so any change to the struct fails the build, not just a doc review.
+
+```c
+// Packed C struct — single source of truth (static_assert'd in pbft_wire.h).
+// The variable-length VC proofs and O-set Pre-Prepares follow this fixed
+// 76-byte prefix on the wire but are NOT part of the struct (caller uses
+// buffer-offset accessors pbft_nv_get_vc() and pbft_nv_get_pp()).
+typedef struct __attribute__((packed)) {
+    pbft_common_header_t hdr;                    //  4 B
+    uint32_t            view;                   //  4 B — new view number (v+1)
+    uint8_t             num_vc;                 //  1 B
+    uint8_t             reserved0[3];           //  3 B — MBZ
+    uint8_t             v_set_digest[PBFT_MAC_BYTES];  // 32 B
+    // variable: num_vc × pbft_view_change_t (VC proofs)
+    // variable: o_set[] Pre-Prepares (each carries its own Pre-Prepare MAC)
+    uint8_t             mac[PBFT_MAC_BYTES];    // 32 B — outer MAC over prefix + VC proofs
+} pbft_new_view_t;   // fixed prefix: 4 + 4 + 1 + 3 + 32 + 32 = 76 B
+
+_Static_assert(sizeof(pbft_new_view_t) == 76, "pbft_new_view_t fixed prefix must be 76 B");
+_Static_assert(__builtin_offsetof(pbft_new_view_t, mac) == 44,
+               "pbft_new_view_t.mac offset must be 44 (after v_set_digest)");
+```
+
+Wire diagram (matches the struct exactly):
+
 ```
    0                   1                   2                   3
    0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
@@ -252,12 +288,23 @@ This is documented in PROTOCOL.md §8.2: because the New-View message exceeds th
 ### 5.1 Pseudocode: handle VIEW-CHANGE
 
 ```c
+// AUDIT-FIX VC-1 (2026-06-29): reject only STALE views, not premature ones.
+// Earlier code used `vc->new_view != view_state.view + 1` which silently
+// rejected cascade VCs targeting v+2, v+3, … — see §9.5 cascade rule.
+// AUDIT-FIX VC-11 (2026-06-29): per-sender max-view bookkeeping via
+// vc_set_view[s]. The earlier `vc_set_from` bitmask was first-write-wins
+// per sender and lost higher-target cascade VCs from a sender that had
+// already escalated. With vc_set_view[7] we keep the highest target seen
+// from each sender and check quorum on
+// count(s : vc_set_view[s] >= current_target_view).
 void pbft_handle_view_change(const pbft_view_change_t* vc, uint8_t sender) {
     // 1. Validate sender and message
     if (sender >= PBFT_CLUSTER_SIZE) return;
-    if (vc->new_view != view_state.view + 1) {
-        log_warn("VC new_view=%lu != my view+1=%lu — stale or premature",
-                 vc->new_view, view_state.view + 1);
+    // Stale: this VC targets a view <= my current view → drop.
+    // (Do NOT require new_view == view+1 — see §9.5 cascade rule.)
+    if (vc->new_view <= view_state.view) {
+        log_warn("VC new_view=%lu <= my view=%lu — stale",
+                 vc->new_view, view_state.view);
         return;
     }
     // Verify MAC with hmac_keys[sender] (always — VC is never TOFU)
@@ -266,40 +313,52 @@ void pbft_handle_view_change(const pbft_view_change_t* vc, uint8_t sender) {
         return;
     }
 
-    // 2. If I am the new primary, store the VC for V-set
-    uint8_t new_primary = (uint8_t)((view_state.view + 1) % PBFT_CLUSTER_SIZE);
-    if (new_primary == my_node_id) {
-        if (!(view_state.vc_set_from & (1u << sender))) {
-            view_state.vc_set_from |= (1u << sender);
-            view_state.vc_set_count++;
-            // Copy VC into arena slot
-            memcpy(&vc_set_arena[sender], vc, pbft_vc_size(vc));
-            view_state.vc_set[sender] = &vc_set_arena[sender];
+    // 2. Update per-sender max-view (VC-11 cascade bookkeeping)
+    //    Always runs (both primary and replica paths). The arena slot is
+    //    overwritten only when this VC carries a strictly higher new_view
+    //    than what we already have from this sender.
+    if (vc->new_view > view_state.vc_set_view[sender]) {
+        bool first_vc_from_sender = (view_state.vc_set_view[sender] == 0);
+        view_state.vc_set_view[sender] = vc->new_view;
+        // Copy VC into the static arena slot (G19 + VC-11 fix)
+        memcpy(&vc_set_arena[sender], vc, pbft_vc_size(vc));
+        view_state.vc_set[sender] = &vc_set_arena[sender];
+        if (first_vc_from_sender) view_state.vc_set_count++;
+    }
+
+    // 3. Quorum check for the LOWEST target view that has quorum support
+    //    (so we drive the transition to v+1, not skip ahead). For each
+    //    candidate target T = view_state.view + 1, view_state.view + 2, …:
+    //      count(s : vc_set_view[s] >= T) >= PBFT_QUORUM ?
+    //    The first such T wins; pbft_send_new_view() targets T (which the
+    //    new primary also picks — see §6.2).
+    uint32_t target_view = view_state.view + 1;
+    for (; target_view <= vc->new_view; target_view++) {
+        uint8_t supporters = 0;
+        for (int s = 0; s < PBFT_CLUSTER_SIZE; s++) {
+            if (view_state.vc_set_view[s] >= target_view) supporters++;
         }
-        // Trigger when quorum reached
-        if (view_state.vc_set_count >= PBFT_QUORUM &&
-            view_state.phase != PBFT_VIEW_PHASE_WAIT_NEW) {
+        if (supporters >= PBFT_QUORUM) break;   // target_view wins
+    }
+    if (target_view > vc->new_view) return;     // no quorum yet for any target
+
+    // 4. If I am the new primary for `target_view`, send New-View
+    uint8_t new_primary = (uint8_t)(target_view % PBFT_CLUSTER_SIZE);
+    if (new_primary == my_node_id) {
+        if (view_state.phase != PBFT_VIEW_PHASE_WAIT_NEW) {
             view_state.phase = PBFT_VIEW_PHASE_WAIT_NEW;
+            view_state.view = target_view - 1;  // see handle_new_view for the +1
             view_state.new_view_started_ms = now_ms();
-            pbft_send_new_view();   // see §5.3
+            pbft_send_new_view();   // see §6.2
         }
         return;
     }
 
-    // 3. Replica side: record VC toward quorum
-    if (!(view_state.vc_set_from & (1u << sender))) {
-        view_state.vc_set_from |= (1u << sender);
-        view_state.vc_set_count++;
-        memcpy(&vc_set_arena[sender], vc, pbft_vc_size(vc));
-        view_state.vc_set[sender] = &vc_set_arena[sender];
-    }
-
-    // 4. If 2f+1 received and I have not yet sent VC, send now (PBFT §4.2)
-    if (view_state.vc_set_count >= PBFT_QUORUM &&
-        view_state.phase == PBFT_VIEW_PHASE_NORMAL) {
+    // 5. Replica side: if I haven't sent VC for target_view yet, send now
+    if (view_state.phase == PBFT_VIEW_PHASE_NORMAL) {
         view_state.phase = PBFT_VIEW_PHASE_CHANGING;
         view_state.view_change_started_ms = now_ms();
-        pbft_send_view_change(view_state.view + 1);
+        pbft_send_view_change(target_view);
     }
 }
 ```
@@ -364,6 +423,60 @@ void pbft_send_view_change(uint32_t new_view) {
 ```
 
 **Critical:** the prepared-set must include **EXECUTED** entries (already-committed TXs) in addition to PREPARED. Otherwise the new primary cannot prove that already-committed TXs will not be re-executed.
+
+### 5.2a Pseudocode: New-View timeout escalation (AUDIT-FIX VC-5, 2026-06-29)
+
+T5 (New-View timeout, §2) was previously **documented but unimplemented**: §3
+state-machine, §2 trigger table, and §8 liveness step 4 all reference it, but
+no function actually compared `new_view_started_ms + viewchange_timeout_ms`
+against `now_ms()`. The field `new_view_started_ms` was set on entry to
+WAIT_NEW (line 283 of the previous revision) but never read. This function
+fills that gap and must be invoked from the periodic timer loop alongside
+`pbft_check_timeouts()` (CONSENSUS §6.2).
+
+```c
+// Called by the periodic timer loop (same cadence as CONSENSUS §6.2
+// pbft_check_timeouts — typically every 100 ms). Fires T5 escalation
+// when the new primary fails to deliver New-View within
+// `viewchange_timeout_ms` of entering WAIT_NEW.
+void pbft_check_viewchange_timeouts(void) {
+    if (view_state.phase != PBFT_VIEW_PHASE_WAIT_NEW) return;
+
+    uint64_t now = now_ms();
+    uint64_t elapsed = now - view_state.new_view_started_ms;
+    if (elapsed <= view_state.viewchange_timeout_ms) return;  // not yet
+
+    // T5: escalate to a higher view. §9.7 + §8 step 4.
+    uint32_t next_target = view_state.view + 1;  // we are in WAIT_NEW for v+1
+    // SAFETY: cap cascade height (VIEW-CHANGE §9.3 + §12 V3: PBFT_MAX_VIEW_GAP).
+    // Beyond this the node declares "partition mode" (POWER/FAILURE-MODES).
+    if (next_target - s_boot_view > PBFT_MAX_VIEW_GAP) {
+        log_warn("view gap > PBFT_MAX_VIEW_GAP — entering partition mode");
+        pbft_enter_partition_mode();
+        return;
+    }
+
+    log_warn("T5: New-View for view=%lu not received within %lu ms — escalating to view=%lu",
+             view_state.view, view_state.viewchange_timeout_ms, next_target);
+
+    // Reset V-set bookkeeping for the next target (VC-11 cascade supports this)
+    view_state.vc_set_count = 0;
+    for (int s = 0; s < PBFT_CLUSTER_SIZE; s++) {
+        view_state.vc_set_view[s] = 0;
+        view_state.vc_set[s] = NULL;
+    }
+
+    // Broadcast our own VIEW-CHANGE for the higher target (§5.2 with new_view=next_target).
+    // Note: pbft_send_view_change() reads view_state.view + assigns new_view from arg.
+    view_state.phase = PBFT_VIEW_PHASE_CHANGING;
+    view_state.view_change_started_ms = now;
+    pbft_send_view_change(next_target);
+}
+```
+
+**Scheduling:** register this function in the periodic timer loop created by
+`pbft_start()` (the same loop that drives `pbft_check_timeouts()` from
+[CONSENSUS.md §6.2](./CONSENSUS.md)). Typical cadence: 100 ms.
 
 ### 5.3 Pseudocode: handle NEW-VIEW (replica)
 
@@ -456,7 +569,12 @@ void pbft_handle_new_view(const pbft_new_view_t* nv, uint8_t sender) {
     view_state.primary_id = expected_primary;
     view_state.phase = PBFT_VIEW_PHASE_NORMAL;
     view_state.vc_set_count = 0;
-    view_state.vc_set_from = 0;
+    // AUDIT-FIX VC-11 (2026-06-29): reset the per-sender max-view array
+    // (replaces the old vc_set_from bitmask).
+    for (int s = 0; s < PBFT_CLUSTER_SIZE; s++) {
+        view_state.vc_set_view[s] = 0;
+        view_state.vc_set[s] = NULL;
+    }
 
     // 8. For each O-set Pre-Prepare, run it through the normal Pre-Prepare handler
     for (int i = 0; i < n_o; i++) {
@@ -560,8 +678,15 @@ uint8_t pbft_compute_o_set(const pbft_new_view_t* nv,
 
         if (c && c->n_votes >= PBFT_F + 1) {
             memcpy(pp->digest, c->digest, 32);
-            // Try to recover the payload from local log
-            pbft_log_entry_t* e = pbft_log_find(view_state.view, seq);
+            // AUDIT-FIX VC-3 (2026-06-29): lookup by SEQUENCE only.
+            // Sequences are view-global (CONSENSUS §3.1), so the (view, seq)
+            // tuple is over-specified. The old call `pbft_log_find(view, seq)`
+            // used the OLD view (this function runs before handle_new_view
+            // applies the new view) and so failed for any prepared entry
+            // whose view differs from the current old view — every
+            // cross-view prepared entry fell back to no-op (state-transfer
+            // on every view-change).
+            pbft_log_entry_t* e = pbft_log_find_by_seq(seq);
             if (e && e->payload_len > 0) {
                 pp->payload = e->payload;
                 pp->payload_len = e->payload_len;
@@ -657,7 +782,7 @@ The standard PBFT safety argument (PBFT paper §4.4) applies. Key invariants:
 
 3. **New primary computes and broadcasts.** The new primary (`view+1 mod n`) is honest (probability `(n-f)/n = 5/7` per round; with retries, 1 in O(log rounds)). It computes O-set and broadcasts NEW-VIEW.
 
-4. **New-View reaches all honest replicas.** UDP broadcast is unreliable, but the new primary can retransmit until it has received `2f+1` ACKs (replicas reply with Prepare for at least one O-set entry). Or simpler: replicas that don't receive New-View within `viewchange_timeout_ms` send `VIEW-CHANGE(v+2)` → process repeats with the next primary.
+4. **New-View reaches all honest replicas.** UDP broadcast is unreliable, but the new primary can retransmit until it has received `2f+1` ACKs (replicas reply with Prepare for at least one O-set entry). Or simpler: replicas that don't receive New-View within `viewchange_timeout_ms` trigger **T5** (see §2 and §5.2a) via `pbft_check_viewchange_timeouts()` → they send `VIEW-CHANGE(v+2)` → process repeats with the next primary.
 
 5. **Progress.** Within `O(viewchange_timeout_ms)` (default 2000 ms), the cluster is back in `VIEW_NORMAL` for view `v+1`. Throughput is briefly reduced; steady-state latency resumes.
 
@@ -704,7 +829,7 @@ A replica can be in view-change round 3 (target view v+3) while another replica 
 
 **Rule:** on receiving `VIEW-CHANGE(new_view = v+k)` for `k > 1`, accept it as a vote for all intermediate targets `v+1, v+2, ..., v+k`. The first to reach quorum (whichever target) drives the next transition.
 
-This is captured in §5.1 step 1 by allowing any `new_view >= view_state.view + 1`.
+This is captured in §5.1 step 1 by allowing any `new_view > view_state.view` (the old strict-equality check `!= view+1` was a bug — fixed 2026-06-29 under VC-1), and in §5.1 step 2 by `vc_set_view[s]` tracking the per-sender maximum target (rather than a first-write-wins bitmask — fixed 2026-06-29 under VC-11).
 
 ### 9.6 Replica receives VIEW-CHANGE for a view lower than its current view
 

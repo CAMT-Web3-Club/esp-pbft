@@ -262,7 +262,7 @@ Seven ESP32-C3 devkits are flashed with the same firmware, each with a unique `n
 |---|------|----------------|
 | C1 | All 7 boot, no errors | All reach PBFT_STATE_NORMAL within 10 s |
 | C2 | Submit from each node in turn | TX committed at all 7 within 200 ms |
-| C3 | Sustained 14 TPS for 10 min | All TXs committed; heap stable; no view-changes |
+| C3 | Sustained 14 TPS for 10 min | All TXs committed; heap stable; **view-changes allowed if cluster re-converges within 3 s** |
 | C4 | Power-cycle one node mid-test | Node re-handshakes; catches up; resumes consensus |
 | C5 | Sustained 1 TPS for 24 hours | All TXs committed; no memory leaks (heap_min ≥ 16 KB) |
 | C6 | Wi-Fi AP outage (toggle) | STAs reconnect; consensus resumes within 5 s |
@@ -411,6 +411,39 @@ From POWER.md §4.4:
 |----------|---------------------------|---------------------------------------------|
 | 14 TPS sustained | ~8 mA | ~60 mA |
 | 1 TPS sustained | ~2 mA | ~25 mA |
+
+### 8.5 Statistical pass criteria (AUDIT-FIX IR-7, 2026-06-29)
+
+The latency targets in §8.1 and throughput targets in §8.2 are MEANINGFUL only
+with a defined statistical methodology. Previously the targets stood alone
+with no sample size, warm-up, number of runs, or pass rule — the CI gate was
+undefined and would either ship flaky builds or brick CI forever. The table
+below is the explicit contract:
+
+| Performance metric | Sample size | Warm-up | Runs | Pass rule |
+|--------------------|------------:|--------:|-----:|-----------|
+| P50 commit latency (single TX) | ≥ 1000 TXs (random gap) | 60 s | ≥ 10 | P50 ≤ 35 ms in 9 of 10 runs |
+| P99 commit latency (single TX) | ≥ 1000 TXs | 60 s | ≥ 10 | P99 ≤ 100 ms in 9 of 10 runs |
+| P99.9 commit latency (single TX) | ≥ 1000 TXs | 60 s | ≥ 10 | P99.9 ≤ 500 ms in 9 of 10 runs |
+| Sustained throughput (back-to-back) | ≥ 5000 TXs | 60 s | ≥ 3 | ≥ 13 TPS (ESP-NOW) in 2 of 3 runs |
+| Heap-min during 24 h soak | 1 sample / 60 s | n/a | 1 | heap_min ≥ 16 KB at every sample |
+| View-changes triggered during C3/C5 | runs = 10 min each | n/a | 1 | re-converge < 3 s after each (cluster must apply New-View and resume) |
+| Liveness after Byzantine injection (BF1–BF7) | per scenario | 5 s | 1 | cluster commits ≥ 100 TXs within 30 s post-attack |
+
+**Run-to-run independence:** each run is a fresh `idf.py flash` + power-cycle;
+no state is shared between runs. The host harness `mock_timer` resets the
+virtual time at run boundary.
+
+**Byzantine loss-budget (§5.3 C3 was previously "no view-changes"):** a
+correct view-change triggered by a Byzantine primary is NOT a test failure.
+The pass criterion is that the cluster re-converges within `3 s` of the
+view-change trigger; the new primary applies the New-View and resumes
+committing. View-changes from primary misbehavior that fail to re-converge
+within `3 s` are a liveness bug.
+
+**TX-loss budget:** at 14 TPS, ≤ 0.01% TX loss due to RF is acceptable (≤ 8
+TX/80000). TXs lost during a view-change retried by the application do NOT
+count against this budget if the retry commits within `viewchange_timeout_ms`.
 
 ---
 

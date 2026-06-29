@@ -110,7 +110,7 @@ there is no per-entry `app_cb`. The node-level state type `pbft_state_t` / `PBFT
 
 **Static array:** `pbft_log[PBFT_LOG_MAX_ENTRIES]` = `100 × ~360 B` = **~36 KB** in BSS (see [MEMORY.md §2.3](./MEMORY.md)).
 
-**Cross-view cleanup:** On view-change to view V, scan log and free any entries where `entry->view < V` and `entry->state < PBFT_ENTRY_COMMITTED` (uncommitted). The `prepare_bitmask`/`commit_bitmask` must be cleared and `own_*_sent` reset because the new view assigns fresh sequence numbers (see [VIEW-CHANGE.md §5.2](./VIEW-CHANGE.md)).
+**Cross-view cleanup:** On view-change to view V, scan log and free any entries where `entry->view < V` AND `entry->state == PBFT_ENTRY_FREE` (i.e. **never-allocated slots below the new view**, never content entries). AUDIT-FIX VC-4 (2026-06-29): the previous wording `state < PBFT_ENTRY_COMMITTED (uncommitted)` was wrong — it would free `PRE_PREPARED` and `PREPARED` entries, exactly the entries the new primary needs to build a defensible V-set (VIEW-CHANGE §5.2 scans `pbft_log[]` for entries with `state ∈ {PREPARED, COMMITTED, EXECUTED}` above `low_watermark`). Freeing them empties the prepared-set, weakening the V-set and letting a Byzantine primary silently omit those TXs. The corrected rule frees ONLY never-allocated (`PBFT_ENTRY_FREE`) slots; everything else is retained through the view-change. The `prepare_bitmask`/`commit_bitmask` must still be cleared and `own_*_sent` reset because the new view assigns fresh sequence numbers (see [VIEW-CHANGE.md §5.2](./VIEW-CHANGE.md)).
 
 **Anti-replay across views:** The MAC input binds `view‖sequence‖type‖digest‖payload` (see [CRYPTO.md §5.1](./CRYPTO.md)). A Prepare broadcast in view V cannot be replayed in view V+1 because the view field in the MAC input differs. The receiving replica recomputes MAC with the new view — the old MAC will not verify.
 
@@ -190,6 +190,90 @@ typedef struct {
    View-change during any state → see [VIEW-CHANGE.md](./VIEW-CHANGE.md)
 ```
 
+### 4.2a Pending-message buffer (AUDIT-FIX VC-9, 2026-06-29)
+
+When a Prepare or Commit arrives for a (view, seq) the replica has not yet seen
+a Pre-Prepare for, the message is buffered in a small ring and replayed when
+the Pre-Prepare creates the log entry. ESP-NOW delivers out-of-order with
+5–10% loss, so a peer message may arrive before the primary's Pre-Prepare.
+Without this buffer, those votes would be silently dropped (audit VC-9).
+
+```c
+// 32-entry ring per node (BSS, 32 × ~44 B ≈ 1.4 KB).
+// One slot covers either a Prepare or a Commit (we only need the digest +
+// sender + message-type to replay). When the log entry for (view, seq) is
+// created, drain all slots matching that (view, seq) and feed them back into
+// pbft_handle_prepare / pbft_handle_commit.
+typedef enum {
+    PBFT_PEND_PREPARE = 0,
+    PBFT_PEND_COMMIT,
+} pbft_pend_kind_t;
+
+typedef struct {
+    bool          in_use;
+    uint32_t      view;
+    uint64_t      sequence;
+    uint8_t       sender_id;
+    pbft_pend_kind_t kind;
+    uint8_t       digest[PBFT_MAC_BYTES];
+} pbft_pend_slot_t;
+
+#define PBFT_PEND_RING_CAP 32
+static pbft_pend_slot_t s_pend_ring[PBFT_PEND_RING_CAP];
+
+void pbft_pending_prepare_buf_push(uint32_t view, uint64_t seq,
+                                    uint8_t sender, const uint8_t digest[32]) {
+    for (int i = 0; i < PBFT_PEND_RING_CAP; i++) {
+        if (!s_pend_ring[i].in_use) {
+            s_pend_ring[i] = (pbft_pend_slot_t){
+                .in_use = true, .view = view, .sequence = seq,
+                .sender_id = sender, .digest = {0},
+            };
+            memcpy(s_pend_ring[i].digest, digest, 32);
+            return;
+        }
+    }
+    // Ring full — drop oldest (FIFO). Loss of one vote is recoverable; view-change
+    // if quorum never reaches (PBFT §4 timeout).
+    int oldest = 0;
+    for (int i = 1; i < PBFT_PEND_RING_CAP; i++) {
+        if (s_pend_ring[i].view < s_pend_ring[oldest].view) oldest = i;
+    }
+    s_pend_ring[oldest] = (pbft_pend_slot_t){
+        .in_use = true, .view = view, .sequence = seq,
+        .sender_id = sender,
+    };
+    memcpy(s_pend_ring[oldest].digest, digest, 32);
+}
+
+// Called from pbft_handle_pre_prepare / pbft_handle_prepare / pbft_handle_commit
+// after the entry exists. Drains matching slots and re-feeds them through the
+// standard handler. NOTE: must be called BEFORE setting the current message's
+// bit, so duplicates are still safely dropped by the per-sender bitmask check.
+void pbft_pending_prepare_buf_replay_for(pbft_log_entry_t* entry) {
+    for (int i = 0; i < PBFT_PEND_RING_CAP; i++) {
+        if (!s_pend_ring[i].in_use) continue;
+        if (s_pend_ring[i].view != entry->view) continue;
+        if (s_pend_ring[i].sequence != entry->sequence) continue;
+        if (s_pend_ring[i].kind == PBFT_PEND_PREPARE) {
+            pbft_prepare_t p = {.view = entry->view, .sequence = entry->sequence};
+            memcpy(p.digest, s_pend_ring[i].digest, 32);
+            uint8_t sender = s_pend_ring[i].sender_id;
+            s_pend_ring[i].in_use = false;
+            pbft_handle_prepare(&p, sender);
+        } else {
+            pbft_commit_t c = {.view = entry->view, .sequence = entry->sequence};
+            memcpy(c.digest, s_pend_ring[i].digest, 32);
+            uint8_t sender = s_pend_ring[i].sender_id;
+            s_pend_ring[i].in_use = false;
+            pbft_handle_commit(&c, sender);
+        }
+    }
+}
+```
+
+**Memory:** 32 × ~48 B = ~1.5 KB BSS. Recorded in [MEMORY.md §2](./MEMORY.md).
+
 ### 4.2 Pseudocode: handle Pre-Prepare
 
 ```c
@@ -235,6 +319,14 @@ void pbft_handle_pre_prepare(const pbft_pre_prepare_t* pp, uint8_t sender) {
     // 7. Record own Prepare
     entry->prepare_bitmask  = (uint8_t)(1u << my_node_id);
     entry->own_prepare_sent = true;
+
+    // AUDIT-FIX VC-9 (2026-06-29): replay any Prepare/Commit messages that
+    // arrived earlier for this (view, seq) but were buffered because the
+    // Pre-Prepare hadn't been seen yet. Without this, out-of-order delivery
+    // (common on ESP-NOW with 5–10% loss) would silently drop those votes
+    // and force a view-change. The buffer is bounded (32 entries per node);
+    // see §4.2a (added 2026-06-29).
+    pbft_pending_prepare_buf_replay_for(entry);
 }
 ```
 
@@ -242,9 +334,21 @@ void pbft_handle_pre_prepare(const pbft_pre_prepare_t* pp, uint8_t sender) {
 
 ```c
 void pbft_handle_prepare(const pbft_prepare_t* p, uint8_t sender) {
-    // 1. Find log entry
+    // AUDIT-FIX VC-9 (2026-06-29): buffer Prepare/Commit that pre-date the
+    // Pre-Prepare. ESP-NOW delivers out-of-order and with 5–10% loss, so a
+    // Prepare from peer X can arrive BEFORE the primary's Pre-Prepare for
+    // the same seq. The old `if (!entry) return;` dropped that Prepare
+    // permanently, never contributing to quorum even after the Pre-Prepare
+    // arrived. The fix buffers one Prepare + one Commit per (view, seq) in
+    // a small static ring and replays it at Pre-Prepare creation time.
     pbft_log_entry_t* entry = pbft_log_find(p->view, p->sequence);
-    if (!entry) return;  // haven't seen Pre-Prepare yet
+    if (!entry) {
+        // Out-of-order: buffer the Prepare until Pre-Prepare arrives.
+        pbft_pending_prepare_buf_push(p->view, p->sequence, sender, p->digest);
+        return;
+    }
+    // Apply any buffered Prepares for this (view, seq) first (replay).
+    pbft_pending_prepare_buf_replay_for(entry);
 
     // 2. Verify digest matches our Pre-Prepare
     if (memcmp(entry->digest, p->digest, 32) != 0) {
@@ -280,8 +384,15 @@ void pbft_handle_prepare(const pbft_prepare_t* p, uint8_t sender) {
 
 ```c
 void pbft_handle_commit(const pbft_commit_t* c, uint8_t sender) {
+    // AUDIT-FIX VC-9 (2026-06-29): see note in pbft_handle_prepare — same
+    // buffer-and-replay pattern for Commit. The buffer is unified for both
+    // Prepare and Commit (keyed on (view, seq, sender_id)).
     pbft_log_entry_t* entry = pbft_log_find(c->view, c->sequence);
-    if (!entry) return;
+    if (!entry) {
+        pbft_pending_prepare_buf_push(c->view, c->sequence, sender, c->digest);
+        return;
+    }
+    pbft_pending_prepare_buf_replay_for(entry);
 
     // Record first Commit observation time
     if (entry->commit_bitmask == 0) {
@@ -375,6 +486,17 @@ esp_err_t pbft_submit(pbft_tx_t* tx) {
         .primary_id = my_node_id,
     };
     pbft_send_pre_prepare(&pp);
+
+    // AUDIT-FIX VC-6 (2026-06-29): locally invoke pbft_handle_pre_prepare so the
+    // primary enters PRE_PREPARED → PREPARED state. Without this, Prepares from
+    // replicas arrive at the primary, `pbft_log_find` returns NULL, and Prepares
+    // are silently dropped at §4.3 line 247. ESP-NOW loopback is configurable
+    // and unreliable in some driver configurations; the standard PBFT
+    // construction (Castro-Liskov §4.2) treats the primary as also being a
+    // replica for its own Pre-Prepare. The local dispatch creates the log
+    // entry, sets our own Prepare bit, and broadcasts our Prepare (via the
+    // standard handler).
+    pbft_handle_pre_prepare(&pp, my_node_id);
 
     return ESP_OK;
 }

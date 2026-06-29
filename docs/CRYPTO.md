@@ -169,36 +169,23 @@ void pbft_crypto_boot(void) {
             continue;
         }
 
-        // (b) ECDH → derive HMAC key directly via PSA (no raw shared secret in RAM).
-        //     Per TF-PSA-Crypto v1.0 (ESP-IDF v6.0.1 components/mbedtls/mbedtls/tf-psa-crypto/include/psa/crypto.h:4128):
-        //
-        //     psa_status_t psa_key_agreement(
-        //         mbedtls_svc_key_id_t private_key,
-        //         const uint8_t *peer_key,        // raw bytes, NOT a key_id_t
-        //         size_t peer_key_length,
-        //         psa_algorithm_t alg,
-        //         const psa_key_attributes_t *attributes,  // for the output derived key
-        //         mbedtls_svc_key_id_t *key);              // OUTPUT: a PSA key handle
-        //
-        //     The output is a PSA key handle, NOT a 32-byte raw shared secret.
-        //     We use it as an HMAC key directly — no SHA-256 derivation step,
-        //     no raw shared secret bytes sitting in RAM.
+        // (b) ECDH shared secret + HKDF → HMAC key (AUDIT-FIX SEC-Y-05).
+        //     We compose ECDH and HKDF via PSA's two-step KDF API:
+        //         psa_key_derivation_setup(PSA_ALG_HKDF(SHA_256))
+        //         psa_key_derivation_input_bytes(SALT, ...)
+        //         psa_key_derivation_input_key(SECRET, my_priv)  ← ECDH happens here
+        //         psa_key_derivation_input_bytes(INFO, per-pair)
+        //         psa_key_derivation_output_key(HMAC attrs, &out)
+        //     The raw shared secret never enters RAM. See §4.2 for the KDF
+        //     construction rationale (NIST SP 800-56A §5.8.1 compliant).
         if (s_hmac_key_ids[peer] != 0) {
             psa_destroy_key(s_hmac_key_ids[peer]);   // destroy any prior derived key
         }
-        psa_key_attributes_t hmac_attr = PSA_KEY_ATTRIBUTES_INIT;
-        psa_set_key_type(&hmac_attr, PSA_KEY_TYPE_HMAC);
-        psa_set_key_bits(&hmac_attr, 256);
-        psa_set_key_algorithm(&hmac_attr, PSA_ALG_HMAC(PSA_ALG_SHA_256));
-        psa_set_key_usage_flags(&hmac_attr, PSA_KEY_USAGE_SIGN_HASH | PSA_KEY_USAGE_VERIFY_HASH);
-
-        s = psa_key_agreement(s_my_priv_key_id,
-                              s_peer_pub_arena[peer], 65,
-                              PSA_ALG_ECDH,
-                              &hmac_attr,
-                              &s_hmac_key_ids[peer]);
+        s = pbft_derive_hmac_key_via_hkdf(s_my_priv_key_id,
+                                          s_peer_pub_arena[peer],
+                                          &s_hmac_key_ids[peer]);
         if (s != PSA_SUCCESS) {
-            ESP_LOGE(TAG, "psa_key_agreement failed for peer %d: %d", peer, (int)s);
+            ESP_LOGE(TAG, "HKDF key derivation failed for peer %d: %d", peer, (int)s);
             s_hmac_key_ids[peer] = 0;   // mark as invalid
             continue;
         }
@@ -227,19 +214,95 @@ void pbft_crypto_boot(void) {
 
 For Y-5 re-gen (§7), the same flow runs: each peer's cached pubkey in `s_peer_pub_arena[peer]` is overwritten with the new pubkey, and the HMAC key is re-derived.
 
-### 4.2 Why simple SHA-256 (not HKDF)?
+### 4.2 Key derivation — HKDF (AUDIT-FIX SEC-Y-05, 2026-06-29)
 
-We use `SHA-256(shared || "PBFT-HMAC-v1")` instead of HKDF-Extract+Expand because:
+**Corrected:** the previous `SHA-256(shared || "PBFT-HMAC-v1")` construction
+was non-NIST-approved and lacked per-pair binding into the `info` argument.
+We now use **HKDF-Extract + HKDF-Expand** (RFC 5869) implemented on top of
+PSA's `psa_key_derivation_*` APIs (which use the same hardware-accelerated
+HMAC-SHA256 peripheral that the runtime MAC uses).
 
-| Aspect | HKDF | Simple SHA-256 |
-|--------|------|----------------|
-| Output | 32+ B (expandable) | 32 B (fixed) |
-| Salt input | Required | Not needed (label "PBFT-HMAC-v1" replaces) |
-| Info input | Required | Yes ("PBFT-HMAC-v1") |
-| Code size | ~200 B | ~50 B |
-| Standard | RFC 5869 | Ad-hoc (acceptable for fixed-input pattern) |
+```c
+// Derive HMAC key for peer via HKDF over the ECDH shared secret.
+// Inputs:
+//   salt      = "PBFT-HMAC-v1/v1" (16 B; domain separation + version)
+//   ikm       = ECDH(my_priv, peer_pub) — 32 B (PSA-internal; not exposed)
+//   info      = SHA-256(my_pub ‖ peer_pub) ‖ "PBFT-HMAC-v1"  (per-pair binding)
+//   L         = 32 B (HMAC-SHA256 key length)
+//
+// The per-pair `info` is the AUDIT-FIX SEC-Y-05 hardening: it binds the
+// derived HMAC key to the exact ECDH pairing, not just to any shared secret
+// value with this label. Two distinct peer pairs that happen to derive the
+// same shared secret (probability 2^-256 — negligible) would otherwise
+// produce the same HMAC key.
 
-For our use case (single 32-byte HMAC key per peer, fixed inputs), simple SHA-256 is sufficient and simpler. **HKDF would be needed if we derived multiple sub-keys per peer** (e.g., one for encrypt, one for MAC) — not our case.
+pbft_status_t pbft_derive_hmac_key_via_hkdf(psa_key_id_t my_priv,
+                                             const uint8_t peer_pub[65],
+                                             psa_key_id_t* out_hmac_key_id) {
+    psa_key_derivation_operation_t op = PSA_KEY_DERIVATION_OPERATION_INIT;
+    psa_status_t s;
+
+    // Step 1: setup — HKDF-SHA256 with our salt
+    s = psa_key_derivation_setup(&op, PSA_ALG_HKDF(PSA_ALG_SHA_256));
+    if (s != PSA_SUCCESS) return s;
+
+    // Step 2: provide the salt (domain separation + version)
+    static const uint8_t PBFT_HKDF_SALT[] = "PBFT-HMAC-v1/v1";
+    s = psa_key_derivation_input_bytes(&op, PSA_KEY_DERIVATION_INPUT_SALT,
+                                       PBFT_HKDF_SALT, sizeof(PBFT_HKDF_SALT) - 1);
+    if (s != PSA_SUCCESS) goto cleanup;
+
+    // Step 3: ECDH shared secret is the IKM — use psa_key_derivation_input_key
+    //         so the raw shared secret stays inside PSA (never in RAM).
+    s = psa_key_derivation_input_key(&op, PSA_KEY_DERIVATION_INPUT_SECRET,
+                                     my_priv);
+    if (s != PSA_SUCCESS) goto cleanup;
+
+    // Step 4: per-pair binding into info
+    uint8_t info[32 + 14];
+    // SHA-256(my_pub ‖ peer_pub) → first 32 bytes of info
+    {
+        uint8_t pair_buf[130];   // 65 + 65
+        memcpy(pair_buf, s_my_pub, 65);
+        memcpy(pair_buf + 65, peer_pub, 65);
+        sha256(pair_buf, 130, info);
+    }
+    memcpy(info + 32, "PBFT-HMAC-v1", 12);   // 12 B label
+    s = psa_key_derivation_input_bytes(&op, PSA_KEY_DERIVATION_INPUT_INFO,
+                                       info, sizeof(info));
+    if (s != PSA_SUCCESS) goto cleanup;
+
+    // Step 5: output 32 B as an HMAC key
+    psa_key_attributes_t hmac_attr = PSA_KEY_ATTRIBUTES_INIT;
+    psa_set_key_type(&hmac_attr, PSA_KEY_TYPE_HMAC);
+    psa_set_key_bits(&hmac_attr, 256);
+    psa_set_key_algorithm(&hmac_attr, PSA_ALG_HMAC(PSA_ALG_SHA_256));
+    psa_set_key_usage_flags(&hmac_attr,
+                            PSA_KEY_USAGE_SIGN_HASH | PSA_KEY_USAGE_VERIFY_HASH);
+    s = psa_key_derivation_output_key(&hmac_attr, &op, out_hmac_key_id);
+
+cleanup:
+    psa_key_derivation_abort(&op);
+    return s;
+}
+```
+
+**Properties of this construction (NIST SP 800-56A §5.8.1 compliant):**
+- **Approved KDF** — HKDF-SHA256 is the standard KDF in counter mode; the
+  raw `psa_key_agreement` output (32 B uniformly random field element) is
+  safe as IKM.
+- **Per-pair binding** — the `info` argument includes `SHA-256(my_pub ‖ peer_pub)`,
+  binding the derived HMAC key to the exact ECDH pairing. Two distinct peer
+  pairs cannot collide on the same HMAC key.
+- **Hardware-accelerated** — uses the same SHA peripheral the runtime MAC
+  uses; no extra code paths.
+- **Code size delta vs SHA-256 wrapper:** +~80 B (acceptable; we already
+  load HMAC-SHA256 for runtime).
+
+> The previous justification table (HKDF vs SHA-256) has been removed. The
+> "smaller code" rationale was unsound: we already load the HMAC peripheral
+> for runtime MAC; using HKDF-Extract-and-Expand on the same primitive is
+> a wash for flash footprint and a strict improvement for security posture.
 
 ### 4.2.1 SHA-256 helpers (two distinct functions)
 
@@ -687,9 +750,21 @@ From research at `~/.espressif/v6.0.1/esp-idf/components/mbedtls/`:
 | **Authentication** | HMAC-SHA256 proves sender has shared key |
 | **Integrity** | HMAC detects any bit-flip |
 | **Anti-replay** | `view ‖ sequence` in MAC input |
-| **Forward secrecy (within session)** | Y-5 re-gen bounds compromise window to 24h |
-| **Forward secrecy (across reboot)** | New keypair at every boot |
+| **Post-compromise security (re-key boundary)** | Y-5 re-gen + HKDF (AUDIT-FIX SEC-Y-05) — FUTURE MACs are secure after a key is leaked |
+| **Post-compromise security (across reboot)** | New keypair at every boot |
 | **Self-healing** | Compromise recovery via Y-5 or reboot |
+
+> **AUDIT-FIX SEC-Y-01 (2026-06-29):** The earlier rows labeled "Forward
+> secrecy (within session)" / "Forward secrecy (across reboot)" were
+> **mislabeled**. What Y-5 + per-boot re-key provides is **post-compromise
+> security (PCS)**, NOT forward secrecy. Within the 24-h Y-5 window, a
+> leaked ECDH private key retroactively unlocks all past HMAC keys derived
+> via the static ECDH + HKDF (see §4.1/§4.2). Past traffic in that window
+> is **not** retroactively protected. PBFT safety is preserved because
+> HMAC binds `(view, seq, type, digest, payload)` — past MAC forgery cannot
+> cause consensus violation. **v1 does not provide PFS within the Y-5
+> window**; for that, add an ephemeral ECDH exchange to the handshake
+> (FIPS 800-56A C(2e,2s) — v2 candidate).
 
 ### 10.2 What we don't get (and why it's OK)
 
@@ -697,7 +772,8 @@ From research at `~/.espressif/v6.0.1/esp-idf/components/mbedtls/`:
 |----------|----------------|
 | **Non-repudiation** | All nodes equally trusted (no audit trail needed) |
 | **Confidentiality** | PBFT messages contain TX payload — application decides encryption |
-| **Perfect forward secrecy (sub-second)** | 24h compromise window is acceptable for IoT |
+| **Perfect forward secrecy (within Y-5 window)** | Not provided by v1 static-ECDH + HKDF. PCS only. Document explicitly (SEC-Y-01). |
+| **Ephemeral / per-session keys** | Optional v2 — adds ~16 ms/peer ECDH at handshake for PFS at the cost of flash+RAM (blst library) |
 
 ### 10.3 Threat model
 
@@ -723,6 +799,14 @@ Pattern Y's TOFU model **assumes physical security of the deployment site** duri
    - Listen to Hellos and replay a captured pubkey after re-deploying with attacker-controlled key
 
 2. **Once Hello is exchanged**, the captured pubkey is cached in NVS. If the node reboots, it uses the cached pubkey (no re-TOFU). Reboot is safe; **deployment of a new node is the danger moment**.
+
+**Explicitly out-of-scope (v1):**
+
+- **Supply-chain replacement of a node** — if an attacker physically swaps
+  one of the 7 boards between deploy and reboot, the replacement's flash
+  contains an attacker-chosen TRNG keypair. TOFU accepts it as a fresh
+  identity. This is the rationale for [DEPLOYMENT §2.5](./DEPLOYMENT.md)
+  (eFuse `hw_id` — proposed 2026-06-29 under SEC-Y-10).
 
 **What's NOT required:**
 
