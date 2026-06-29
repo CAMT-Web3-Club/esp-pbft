@@ -83,7 +83,7 @@ static pbft_transport_status_t espnow_init(const pbft_net_config_t* cfg) {
         esp_now_peer_info_t peer = {
             .peer_addr = PBFT_ESP_NOW_BROADCAST_MAC,   // all-FF
             .channel = 0,
-            .encrypt = false,  // HMAC at PBFT layer, CCMP at ESP-NOW
+            .encrypt = false,  // HMAC at PBFT layer (ESP-NOW encryption disabled to keep v1 simple; CCMP disabled)
         };
         esp_now_add_peer(&peer);
     }
@@ -97,7 +97,9 @@ static pbft_transport_status_t espnow_broadcast(const void* buf, size_t len) {
 }
 ```
 
-**Size constraint:** ESP-NOW max payload = **250 bytes** (verified for ESP32-C3).
+**Size constraint:** ESP-NOW max payload = **250 bytes** for v1.0 (`ESP_NOW_MAX_IE_DATA_LEN` = 250) or **1470 bytes** for v2.0 (`ESP_NOW_MAX_DATA_LEN_V2` = 1470, defined in `esp_now.h` since ESP-IDF v6.0.1).
+
+For esp-pbft v1 we use the v1.0 limit (250 B). View-Change (`PBFT_VC_MAX_PREPARED=4` → 248 B) fits; Pre-Prepare with 256 B payload (338 B) is sent over UDP. New-View (~1.3-4.7 KB) is always UDP.
 
 The `PBFT_ESP_NOW_BROADCAST_MAC` constant is defined in `pbft_network_espnow.h`:
 

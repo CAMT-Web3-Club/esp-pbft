@@ -368,20 +368,34 @@ CONFIG_PBFT_Y5_REGEN_PERIOD_HOURS=1
 
 (1-hour compromise window; higher CPU cost due to frequent re-handshakes.)
 
-### 6.5 ESP-IDF power-save Kconfig (mandatory for ESP-NOW RX duty-cycling)
+### 6.5 ESP-NOW RX power-save Kconfig (esp-pbft defines + ESP-IDF default)
 
-The following ESP-IDF Kconfig entries **must** be set in `sdkconfig.defaults` for esp-pbft's ESP-NOW RX power-saving (POWER.md §9) to work in the disconnected state. They are required by `esp_now_set_wake_window()` per the [Espressif API reference](https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-reference/network/esp_now.html#config-esp-now-power-saving-parameter).
+esp-pbft's ESP-NOW RX duty-cycling (POWER.md §9) needs both an ESP-IDF
+upstream Kconfig **and** esp-pbft-specific Kconfigs. The upstream
+`CONFIG_ESPNOW_*` options are only defined in
+`examples/wifi/espnow/main/Kconfig.projbuild` (an example project), so
+esp-pbft defines its own `CONFIG_PBFT_ESPNOW_*` equivalents in
+`pbft/Kconfig`. Add these to `sdkconfig.defaults`:
 
 ```kconfig
-# ESP-NOW RX power save — required by esp_now_set_wake_window() in disconnected state
+# ESP-IDF upstream — required by esp_now_set_wake_window() in disconnected state
+# (per Espressif wifi-driver/wifi-performance-and-power-save.html)
 CONFIG_ESP_WIFI_STA_DISCONNECTED_PM_ENABLE=y
 
-# Master switch for ESP-NOW RX duty-cycling (see POWER.md §9)
-CONFIG_ESPNOW_ENABLE_POWER_SAVE=y
-
-# 25% duty cycle (50 ms window per 200 ms interval) — tunable
-CONFIG_ESPNOW_WAKE_WINDOW=50
-CONFIG_ESPNOW_WAKE_INTERVAL=200
+# esp-pbft project-local — wraps esp_now_set_wake_window +
+# esp_wifi_connectionless_module_set_wake_interval for our own use
+config PBFT_ESPNOW_POWER_SAVE
+    bool "Enable esp-pbft ESP-NOW RX duty-cycling"
+    default y
+config PBFT_ESPNOW_WAKE_WINDOW_MS
+    int "esp-pbft ESP-NOW wake window (ms)"
+    default 50
+    range 1 100
+config PBFT_ESPNOW_WAKE_INTERVAL_MS
+    int "esp-pbft ESP-NOW wake interval (ms)"
+    default 200
+    range 50 1000
+# 25% duty cycle (50/200 ms) is a good default; tune via menuconfig
 ```
 
 The first entry is the IDF v6.0.1 API contract; without it, `esp_now_set_wake_window()` is documented to no-op when the STA is disconnected. Even though most targets default it to `y`, pin it explicitly in `sdkconfig.defaults` so CI configurations cannot regress it (notably C5/C61 where the default depends on `CONFIG_ESP_HOST_WIFI_ENABLED`).

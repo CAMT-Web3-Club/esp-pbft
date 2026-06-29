@@ -271,33 +271,47 @@ ESP-NOW can sleep the radio between RX windows. The window/interval pair control
 
 ```c
 // In pbft_network_espnow.c, after esp_now_init():
-// Uses canonical Espressif Kconfig names — match DEPLOYMENT.md §6.5 sdkconfig.defaults
-// and the official esp-idf/examples/wifi/espnow pattern.
-#if CONFIG_ESPNOW_ENABLE_POWER_SAVE
+// Uses esp-pbft project-local Kconfig names (CONFIG_PBFT_ESPNOW_*) —
+// see DEPLOYMENT.md §6.5 for rationale. The upstream CONFIG_ESPNOW_*
+// options are only defined in examples/wifi/espnow/, not in the
+// general esp-idf Kconfig tree, so we define our own equivalents.
+#if CONFIG_PBFT_ESPNOW_POWER_SAVE
     // 50 ms window every 200 ms = 25% duty cycle (tunable via Kconfig)
-    esp_wifi_connectionless_module_set_wake_interval(CONFIG_ESPNOW_WAKE_INTERVAL);
-    esp_now_set_wake_window(CONFIG_ESPNOW_WAKE_WINDOW);
+    esp_wifi_connectionless_module_set_wake_interval(CONFIG_PBFT_ESPNOW_WAKE_INTERVAL_MS);
+    esp_now_set_wake_window(CONFIG_PBFT_ESPNOW_WAKE_WINDOW_MS);
 #endif
 ```
 
-> **Why canonical Espressif names, not custom `CONFIG_PBFT_*`:** The Espressif esp-idf
-> example (`examples/wifi/espnow/main/espnow_example_main.c`) uses these exact Kconfig
-> symbols. Re-naming them in esp-pbft creates a fork that diverges from upstream
-> reference code; CI cannot grep one canonical name; users reading the Espressif docs
-> must mentally translate. Define the canonical symbols in `sdkconfig.defaults`
-> (see [DEPLOYMENT.md §6.5](./DEPLOYMENT.md#65-esp-idf-power-save-kconfig-mandatory-for-esp-now-rx-duty-cycling)).
+> **Why project-local `CONFIG_PBFT_ESPNOW_*`, not upstream `CONFIG_ESPNOW_*`:** The
+> upstream `CONFIG_ESPNOW_*` options are only defined in
+> `examples/wifi/espnow/main/Kconfig.projbuild` (an example project) — they
+> do **not** propagate to the general esp-idf Kconfig tree when esp-pbft
+> is built as a component. Re-declaring them with the `CONFIG_PBFT_` prefix
+> makes the symbols real Kconfig options that `menuconfig` exposes, prevents
+> a silent "symbol not defined" warning at build time, and is the only
+> correct way to depend on them from component CMake. See
+> [DEPLOYMENT.md §6.5](./DEPLOYMENT.md#65-esp-now-rx-power-save-kconfig-esp-pbft-defines--esp-idf-default)
+> for the full Kconfig block.
 
 **Reference: required `sdkconfig.defaults` entries (from DEPLOYMENT.md §6.5):**
 
 ```kconfig
-# Master switch for ESP-NOW RX duty-cycling
-CONFIG_ESPNOW_ENABLE_POWER_SAVE=y
+# esp-pbft project-local — wraps esp_now_set_wake_window +
+# esp_wifi_connectionless_module_set_wake_interval for our own use
+config PBFT_ESPNOW_POWER_SAVE
+    bool "Enable esp-pbft ESP-NOW RX duty-cycling"
+    default y
+config PBFT_ESPNOW_WAKE_WINDOW_MS
+    int "esp-pbft ESP-NOW wake window (ms)"
+    default 50
+    range 1 100
+config PBFT_ESPNOW_WAKE_INTERVAL_MS
+    int "esp-pbft ESP-NOW wake interval (ms)"
+    default 200
+    range 50 1000
 
-# 25% duty cycle (50 ms window per 200 ms interval) — tunable
-CONFIG_ESPNOW_WAKE_WINDOW=50
-CONFIG_ESPNOW_WAKE_INTERVAL=200
-
-# Required by esp_now_set_wake_window() in disconnected state
+# ESP-IDF upstream — required by esp_now_set_wake_window() in disconnected state
+# (per Espressif wifi-driver/wifi-performance-and-power-save.html)
 CONFIG_ESP_WIFI_STA_DISCONNECTED_PM_ENABLE=y
 ```
 

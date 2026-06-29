@@ -58,25 +58,25 @@ This is the master index for the esp-pbft design and implementation documentatio
 
 | Doc | Size | Purpose | Status |
 |-----|------|---------|--------|
-| [HANDOVER.md](./HANDOVER.md) | 24 KB | 1-page project overview, key decisions, code structure preview | ✅ Done |
+| [HANDOVER.md](./HANDOVER.md) | 24 KB | 1-page project overview, key decisions, code structure preview | 🟡 Draft (v0.1) |
 | [DESIGN-AUDIT.md](./DESIGN-AUDIT.md) | ~10 KB | Cross-doc consistency check; 25 issues identified | ✅ Done (2026-06-27) |
-| [ARCHITECTURE.md](./ARCHITECTURE.md) | 30 KB | System overview, boot sequence, layering, data flow | ✅ Done |
+| [ARCHITECTURE.md](./ARCHITECTURE.md) | 30 KB | System overview, boot sequence, layering, data flow | 🟡 Draft (v0.1) |
 | [MEMORY.md](./MEMORY.md) | ~15 KB | Per-module memory layout, static_assert catalog, NVS | ✅ Done (v0.1) |
 | [POWER.md](./POWER.md) | ~15 KB | Power state machine, per-mode current, battery math, Wi-Fi PS modem | ✅ Done (v0.2) |
-| [CONSENSUS.md](./CONSENSUS.md) | 22 KB | 3-phase PBFT state machine, quorum, log management | ✅ Done |
+| [CONSENSUS.md](./CONSENSUS.md) | 22 KB | 3-phase PBFT state machine, quorum, log management | 🟡 Draft (v0.1) |
 | [VIEW-CHANGE.md](./VIEW-CHANGE.md) | ~25 KB | Primary rotation, V-set/O-set, New-View verification | ✅ Done (v0.1) |
 | [CHECKPOINT.md](./CHECKPOINT.md) | ~20 KB | Stable checkpoint, GC, state transfer | ✅ Done (v0.1) |
-| [PROTOCOL.md](./PROTOCOL.md) | 20 KB | Wire format, transport abstraction, 7 message types | ✅ Done |
-| [CRYPTO.md](./CRYPTO.md) | 17 KB | Pattern Y handshake, Y-5 re-gen, per-message MAC | ✅ Done |
+| [PROTOCOL.md](./PROTOCOL.md) | 20 KB | Wire format, transport abstraction, 7 message types | 🟡 Draft (v0.1) |
+| [CRYPTO.md](./CRYPTO.md) | 17 KB | Pattern Y handshake, Y-5 re-gen, per-message MAC | 🟡 Draft (v0.1) |
 | [API-REFERENCE.md](./API-REFERENCE.md) | ~25 KB | Complete public C API contract | ✅ Done (v0.1) |
 | [FAILURE-MODES.md](./FAILURE-MODES.md) | ~20 KB | Byzantine scenarios, network failures, recovery | ✅ Done (v0.1) |
 | [DEPLOYMENT.md](./DEPLOYMENT.md) | ~18 KB | Provisioning, NVS image, OTA, Y-5 runbook | ✅ Done (v0.1) |
-| [CODING_STANDARD.md](./CODING_STANDARD.md) | 48 KB | Zephyr MISRA-C subset + CERT C + ESP-IDF style | ✅ Done |
+| [CODING_STANDARD.md](./CODING_STANDARD.md) | 48 KB | Zephyr MISRA-C subset + CERT C + ESP-IDF style | 🟡 Draft (v0.1) |
 | [TEST-PLAN.md](./TEST-PLAN.md) | ~18 KB | Unit / integration / Byzantine / perf / soak tests | ✅ Done (v0.1) |
 | [ROADMAP.md](./ROADMAP.md) | ~12 KB | Phased implementation plan (P1-P5 + P6) | ✅ Done (v0.1) |
-| [INDEX.md](./INDEX.md) | (this) | Master index | ✅ Done |
+| [INDEX.md](./INDEX.md) | (this) | Master index | 🟡 Draft (v0.1) |
 
-**Total: ~338 KB of design documentation** across 16 documents.
+**Total: ~338 KB of design documentation** across 16 documents. **All 17 docs are 🟡 Draft (v0.1)** — see per-doc status banners for the in-doc version. "Done" here means "drafting complete, ready for review" not "frozen / cannot change". See per-doc end-of-file lines for the actual review state.
 
 ---
 
