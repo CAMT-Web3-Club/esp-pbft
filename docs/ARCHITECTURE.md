@@ -497,7 +497,7 @@ These are higher-level than the HANDOVER.md open questions:
 | Peer pubkey cache (7 slots × 65 B) | 7 × 65 B = 455 B | BSS | Permanent (TOFU) |
 | HMAC keys (7 slots × 32 B) | 7 × 32 B = 224 B | BSS | RAM, regenerated on Y-5 |
 | Pending TX / PBFT log (100 entries × ~360 B) | ~36 KB | BSS | Until checkpoint GC |
-| V-set arena (7 × 488 B) | ~3.4 KB | BSS | Per-view |
+| V-set arena (7 × 248 B) | ~1.7 KB | BSS | Per-view (PBFT_VC_MAX_PREPARED=4 after H2 fix) |
 | Checkpoint proof table | ~640 B | BSS | Permanent |
 | Dedup / executed-digest cache (256 × 40 B) | ~10 KB | BSS | Permanent (FIFO) |
 | Network TX buffer | 4 KB | BSS | Permanent |

@@ -156,7 +156,7 @@ typedef struct __attribute__((packed)) {
 ```
 
 **Empty prepared-set:** `n_prepared = 0`, total 88 B — fits ESP-NOW.
-**Worst case:** `n_prepared = 100`, total = 88 + 4000 = **4088 B** — exceeds ESP-NOW. Strategy in §6.
+**Worst case (PBFT_VC_MAX_PREPARED=4):** `n_prepared = 4`, total = 88 + 160 = **248 B** — fits ESP-NOW 250 B with 2 B spare (H2 fix).
 
 The MAC input is `view ‖ new_view ‖ checkpoint_seq ‖ checkpoint_digest ‖ n_prepared ‖ {prepared_entries}` — i.e. everything up to but excluding the MAC field itself.
 
@@ -262,7 +262,11 @@ void pbft_send_view_change(uint32_t new_view) {
     // Build prepared-set from PBFT log: every entry in PREPARED or COMMITTED state
     // with sequence > checkpoint_seq.
     uint8_t n = 0;
-    pbft_prepared_entry_t prepared[PBFT_LOG_MAX_ENTRIES];
+    // CRITICAL: do NOT allocate on stack — pbft_prepared_entry_t × 100 = 4 KB,
+    // and o_set (oops) × 100 = ~33 KB, both would exceed the 8 KB FreeRTOS
+    // task stack. Use a static scratch arena (BSS) instead, sized to the
+    // actual PBFT_VC_MAX_PREPARED=4 cap.
+    static pbft_prepared_entry_t prepared[PBFT_VC_MAX_PREPARED];
 
     for (int i = 0; i < PBFT_LOG_MAX_ENTRIES; i++) {
         pbft_log_entry_t* e = &pbft_log[i];
@@ -363,8 +367,14 @@ void pbft_handle_new_view(const pbft_new_view_t* nv, uint8_t sender) {
         return;
     }
 
-    // 6. Compute O-set locally (must match what new primary computed)
-    pbft_pre_prepare_t o_set[PBFT_LOG_MAX_ENTRIES];
+    // 6. Compute O-set locally (must match what new primary computed).
+    // CRITICAL: o_set must NOT be on stack — pbft_pre_prepare_t × 100 = ~33 KB
+    // would crash the 8 KB FreeRTOS task stack. Use a static scratch arena
+    // (BSS) sized to the documented cap (PBFT_NVIEW_O_SET_MAX = 32 entries
+    // = ~10.8 KB). Caller is single-threaded (one VIEW-CHANGE at a time per
+    // replica), so a single scratch slot is safe.
+    static pbft_pre_prepare_t o_set_arena[PBFT_NVIEW_O_SET_MAX];
+    pbft_pre_prepare_t* o_set = o_set_arena;
     uint8_t n_o = pbft_compute_o_set(nv, o_set);   // deterministic, see §6
     if (n_o == PBFT_O_SET_NEEDS_CATCHUP) {
         // Too far behind to replay the O-set in place (G15 overflow guard).
@@ -530,8 +540,10 @@ uint8_t pbft_compute_o_set(const pbft_new_view_t* nv,
 
 ```c
 void pbft_send_new_view(void) {
-    // 1. Compute O-set deterministically from V-set (cache)
-    pbft_pre_prepare_t o_set[PBFT_LOG_MAX_ENTRIES];
+    // 1. Compute O-set deterministically from V-set (cache).
+    // CRITICAL: not on stack — see warning in pbft_handle_new_view().
+    static pbft_pre_prepare_t o_set_arena[PBFT_NVIEW_O_SET_MAX];
+    pbft_pre_prepare_t* o_set = o_set_arena;
     uint8_t n_o = pbft_compute_o_set_from_cache(o_set);
 
     // 2. Build New-View message

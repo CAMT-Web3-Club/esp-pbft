@@ -193,13 +193,12 @@ static uint8_t s_rx_arena[8192];            // 8 KB — holds full PBFT messages
 ```c
 static psa_key_id_t   s_my_priv_key_id;           // 4 B (handle)
 static uint8_t        s_my_pub[65];               // 65 B (cached for Hello: 0x04 ‖ X_BE ‖ Y_BE)
-static psa_key_id_t   s_peer_pub_key_ids[7];      // 7 × 4 B = 28 B
-static uint8_t        s_peer_pub_arena[7][65];    // 7 × 65 B = 455 B (raw bytes)
+static uint8_t        s_peer_pub_arena[7][65];    // 7 × 65 B = 455 B (raw bytes; no PSA import — see CRYPTO §4.1 H1 fix)
 static psa_key_id_t   s_hmac_key_ids[7];          // 7 × 4 B = 28 B
 static uint8_t        s_hmac_key_arena[7][32];    // 7 × 32 B = 224 B
 static uint8_t        s_zero_key[32];             // 32 B — sentinel for "no key"
 // —————————
-// Total: ~828 B
+// Total: ~800 B (was 828 B pre-H1; dropped s_peer_pub_key_ids[7] = 28 B)
 ```
 
 `psa_key_attributes_t` is a transient PSA struct (~80 B) used during key creation only — stack-allocated.

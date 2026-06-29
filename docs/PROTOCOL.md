@@ -279,7 +279,7 @@ If a future wire field is added that uses a cryptographic format with mixed endi
 | 1 | `PBFT_MSG_PRE_PREPARE` | primary → all | 4 (header) + 4 (view) + 8 (seq) + 32 (digest) + 2 (payload_len) + payload + 32 (mac) = **82 + payload B wire** | §6.2 |
 | 2 | `PBFT_MSG_PREPARE` | all → all | 4 + 4 + 8 + 32 + 32 = **80 B** | §6.3 |
 | 3 | `PBFT_MSG_COMMIT` | all → all | 4 + 4 + 8 + 32 + 32 = **80 B** | §6.4 |
-| 4 | `PBFT_MSG_VIEW_CHANGE` | all → all | 4 + 88 + n_prepared × 40 = **88–4088 B** | §6.5 + [VIEW-CHANGE.md §4.3](./VIEW-CHANGE.md) |
+| 4 | `PBFT_MSG_VIEW_CHANGE` | all → all | 4 + 88 + n_prepared × 40 = **88–248 B** (PBFT_VC_MAX_PREPARED=4, fits ESP-NOW) | §6.5 + [VIEW-CHANGE.md §4.3](./VIEW-CHANGE.md) |
 | 5 | `PBFT_MSG_NEW_VIEW` | new primary → all | var (always UDP) ≈ **2.5–6 KB** | §6.6 + [VIEW-CHANGE.md §4.4](./VIEW-CHANGE.md) |
 | 6 | `PBFT_MSG_CHECKPOINT` | all → all | 4 + 8 + 32 + 32 = **76 B** | §6.7 + [CHECKPOINT.md §5](./CHECKPOINT.md) |
 | 7 | `PBFT_MSG_STATE_REQUEST` | replica → peer | 4 + 4 + 8 + 32 = **48 B** | [CHECKPOINT.md §8](./CHECKPOINT.md) |

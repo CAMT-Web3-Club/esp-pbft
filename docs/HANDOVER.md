@@ -279,7 +279,7 @@ esp-pbft is the consensus layer; the blockchain layer (if needed later) can be a
 | Network buffers | ~16 KB | 4 KB TX + 4 KB RX + 8 KB arena |
 | Dedup cache (audit B10) | ~10 KB | 256 executed digests |
 | TX queue (for `submit_from_isr`) | ~4.5 KB | 16 entries × ~280 B |
-| View state + V-set arena | ~5 KB | single view state + 7 × 488 B VC slots |
+| View state + V-set arena | ~1.8 KB | single view state (~120 B) + 7 × 248 B VC slots (H2 fix) |
 | Checkpoint proofs | ~640 B | 8 in-flight proofs |
 | Misc (metrics, config, etc.) | ~260 B | — |
 | **Subtotal esp-pbft source (BSS)** | **~72 KB** | ~18% of 400 KB |

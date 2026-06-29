@@ -112,8 +112,9 @@ typedef struct {
     uint64_t      next_sequence;        // primary's next-to-assign counter
     uint64_t      last_committed_seq;   // last seq that reached COMMITTED
     uint64_t      last_executed_seq;    // last seq whose app callback fired
-    uint64_t      low_watermark;        // GC: entries below this can be reclaimed
-    uint64_t      high_watermark;       // GC: pre-prepare allowed above this
+    // NOTE: low_watermark and high_watermark live in pbft_watermark_state_t
+    // (single-owner rule per MEMORY §2.4 / H3 fix). Access them via
+    // pbft_watermark_get_low() / pbft_watermark_get_high().
 
     // Timeouts
     uint32_t      prepare_timeout_ms;   // default 1000
@@ -190,8 +191,8 @@ void pbft_handle_pre_prepare(const pbft_pre_prepare_t* pp, uint8_t sender) {
     // 3. Check sequence number is in valid range:
     //    accept low_watermark < seq <= high_watermark
     //    (high_watermark = low_watermark + PBFT_LOG_MAX_ENTRIES)
-    if (pp->sequence <= view_state.low_watermark ||
-        pp->sequence > view_state.high_watermark) {
+    if (pp->sequence <= pbft_watermark_get_low() ||
+        pp->sequence > pbft_watermark_get_high()) {
         log_warn("Pre-Prepare seq %llu out of range", pp->sequence);
         return;
     }
@@ -536,7 +537,7 @@ bool pbft_has_quorum(uint8_t bitmask) {
 ```c
 // Called when CHECKPOINT(seq, digest) reaches quorum
 void pbft_gc_up_to(uint64_t stable_seq) {
-    view_state.low_watermark = stable_seq;
+    pbft_watermark_set_low(stable_seq);
     // Mark log entries below stable_seq as gc_marked
     for (int i = 0; i < PBFT_LOG_MAX_ENTRIES; i++) {
         if (pbft_log[i].sequence <= stable_seq &&
