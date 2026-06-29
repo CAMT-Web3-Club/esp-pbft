@@ -86,6 +86,52 @@ target_compile_options(${COMPONENT_LIB} PRIVATE
 
 ---
 
+### 1.5 Design influences (papers adopted)
+
+esp-pbft is not built in isolation. Each major design decision cites its
+upstream paper so reviewers can verify intent. Three families of ideas
+were drawn from academic BFT literature; the table below says what we
+took and what we explicitly **did not** take.
+
+| Idea | Source paper | Year | Status in esp-pbft v1 | Reasoning |
+|------|--------------|------|----------------------|-----------|
+| **Castro-Liskov PBFT core** (3-phase Prepare/Commit, quorum intersection, view-change) | [Practical Byzantine Fault Tolerance (OSDI 1999)](https://pmg.csail.mit.edu/papers/osdi99.pdf) | 1999 | ✅ **Adopted wholesale** | Foundation; OSDI is the canonical reference |
+| **"No state tree" design** — state mgmt left to the application | PBFT §4.4 (state) | 1999 | ✅ **Adopted** | The TinyBFT/CPI-style 7 MB Merkle tree is overkill for IoT; the app provides its own snapshot/state transfer if needed |
+| **4-region memory layout** (Agreement / Checkpoint / Event / Scratch) + per-region `static_assert` | [TinyBFT (RTAS 2024)](https://doi.org/10.1109/RTAS61025.2024.00026) | 2024 | ✅ **Adopted** (ARCHITECTURE §11.2 / §11.10) | Reduces 7 MB CPI baseline to ~70 KB esp-pbft v1; enables v2 NVM migration |
+| **Linear view-change chain** (each VC carries a `high_qc` reference to prior best Prepare) | [HotStuff (PODC 2019)](https://arxiv.org/abs/1803.05069) §3 | 2019 | ✅ **Adopted** (Yin et al.) | Reduces O(n²) view-change to O(n); fixes the liveness gap when f+1 leaders in a row are Byzantine |
+| **Deterministic leader rotation every view** (not just on suspicion) | HotStuff §3 "linear view-change" | 2019 | ✅ **Adopted** | Same source; complements linear VC. ~5 LOC, 0 B memory. |
+| **BLS aggregate signatures** (n → 1 signature) | HotStuff §3 "threshold signature" | 2019 | ❌ **Not adopted (v1)** | Adds ~50 KB flash (blst) + 5 KB RAM; only worth it at n > 25 (v2 design point) |
+| **HotStuff-2 single-phase commit** (no PreCommit) | [HotStuff-2](https://arxiv.org/abs/2003.10211) | 2020 | ❌ **Not adopted** | Requires threshold sigs; same dependency barrier as above |
+| **Chained HotStuff / Jolteon / Ditto** (QC chaining across views) | [Jolteon/Ditto 2021](https://arxiv.org/abs/2106.10362) | 2021 | ❌ **Not adopted** | Too complex for the v1 threat model (n=7, f=2); the simpler linear VC from original HotStuff is enough |
+| **Event-Driven HotStuff** (DAG-free, event-driven) | [libhotstuff §3.3](https://github.com/hot-stuff/libhotstuff) | 2023 | ❌ **Not adopted** | v1 is bounded by latency, not throughput; DAG gains kick in at n > 20 |
+
+> **Why not full HotStuff?** The cost of full HotStuff is dominated by
+> **BLS threshold signatures** (HotStuff §3.2). esp-pbft v1 uses **HMAC-SHA256**
+> for per-message authentication (see CRYPTO §3, §5) because:
+>
+> 1. n = 7 is small — the O(n²) HMAC overhead at the consensus layer is
+>    dominated by network latency, not crypto (see CRYPTO §9.2).
+> 2. ESP32-C3 has no BLS hardware acceleration; the blst library is ~50 KB
+>    flash + 5 KB RAM just for keypair/aggregate operations.
+> 3. HotStuff **liveness** (the actual *protocol* improvement over PBFT) is
+>    captured by adopting only the linear VC + rotation rules (rows 4–5 above).
+>    The BLS gain is a **bandwidth** optimisation, not a liveness one.
+>
+> Therefore esp-pbft v1 = PBFT 3-phase + HotStuff view-change + TinyBFT memory
+> layout, with a clear upgrade path to BLS in v2 if the deployment grows.
+
+### 1.6 Why esp-pbft, not stock PBFT (one-line pitch)
+
+The reason to build esp-pbft instead of importing an existing PBFT library:
+
+> **ESP32-C3 has 400 KB RAM and no MMU. A stock PBFT (libbyz, BFT-SMaRt) needs
+> 50–250 MB. The optimisation budget we have is ~70 KB. HotStuff-class ideas
+> + TinyBFT-class memory layout is the only way to fit a real BFT into that
+> envelope, and we still keep the 1999 PBFT wire format so the protocol remains
+> recognisable to anyone who has read Castro-Liskov.**
+
+---
+
 ## 2. Architecture (summary — see [ARCHITECTURE.md](./ARCHITECTURE.md))
 
 ### 2.1 Cluster topology
@@ -190,7 +236,7 @@ See [POWER.md](./POWER.md) for ESP-NOW measurements and [FAILURE-MODES.md](./FAI
 
 ### 3.4 Why PSA Crypto?
 
-ESP-IDF v6.0.1 ships **Mbed TLS 4.0.0 + TF-PSA-Crypto**. Legacy `mbedtls_*` APIs are still available but transitional. PSA is the recommended interface because:
+ESP-IDF v6.0.2 (verified June 2026) ships **Mbed TLS 4.0.0 + TF-PSA-Crypto**. Legacy `mbedtls_*` APIs are still available but transitional. PSA is the recommended interface because:
 
 - ✅ Standardised (portable across vendors)
 - ✅ Hardware-accelerated on ESP32-C3 (SHA-256 via dedicated peripheral)
@@ -451,8 +497,8 @@ This folder contains 17 design documents totalling ~340 KB. See [INDEX.md](./IND
 ### Internal
 
 - Research report on authentication patterns (delegated 2026-06-26) — confirms Pattern Y (TRNG + ECDH-boot + HMAC-runtime)
-- ESP-IDF v6.0.1 local install at `~/.espressif/v6.0.1/esp-idf/` (Mbed TLS 4.0.0)
-- `idf_component.yml` declares `idf: ">=6.0.1"` and supported targets
+- ESP-IDF v6.0.2 local install at `~/.espressif/v6.0.2/esp-idf/` (Mbed TLS 4.0.0) — verified against v6.0 and v6.0.1 (all APIs match)
+- `idf_component.yml` declares `idf: ">=6.0.2"` and supported targets
 
 ### External
 
