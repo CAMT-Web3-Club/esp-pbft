@@ -69,7 +69,7 @@ typedef struct {
     uint8_t            digest[32];          // 32 B  SHA-256 of request payload
     uint8_t            msg_type;            //  1 B  request type tag
     uint16_t           payload_len;         //  2 B  bytes used in payload[]
-    uint8_t            payload[256];        // 256 B inline request (PBFT_TX_PAYLOAD_MAX)
+    uint8_t            payload[PBFT_TX_PAYLOAD_MAX];   // 256 B inline request (CHANGED — audit A5)
     pbft_entry_state_t state;               //  4 B  FREE/PRE_PREPARED/PREPARED/COMMITTED/EXECUTED
     uint8_t            prepare_bitmask;     //  1 B  bit i = replica i sent Prepare
     uint8_t            commit_bitmask;      //  1 B  bit i = replica i sent Commit

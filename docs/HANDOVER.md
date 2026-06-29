@@ -257,7 +257,7 @@ Runtime:
 | Aspect | esp-pbft only | + Blockchain |
 |--------|---------------|--------------|
 | LOC | ~5,000 | ~20,000 |
-| Throughput | ~9K tx/sec | ~1K tx/sec |
+| Throughput | **14 TPS** sustained (no batching; 33 TPS sequential in CONSENSUS §9) | **133 TPS** batched (N=4) |
 | Storage | ~10 KB | GB+ |
 | Immutable history | ❌ | ✅ |
 | Smart contracts | ❌ | ✅ |
@@ -308,21 +308,25 @@ See [MEMORY.md](./MEMORY.md) for the detailed per-module layout, `static_assert`
 |------|---------|----------|------------|
 | Active (consensus) | see POWER.md §12.6 | derived (workload-model) | see POWER.md §12.6 |
 | Light sleep | 0.13 mA (130 µA datasheet typ) | per POWER.md §4.2 | derived |
-| **Total** | — | — | **~52 mAh/day** (PS_MIN_MODEM + light-sleep) |
+| **Total** | ~7.96 mA avg | — | **~191 mAh/day** (from POWER.md §4.4) |
 
-→ 1000 mAh battery → **~19 days battery life**
+→ 1000 mAh battery → **~5 days battery life** at 14 TPS sustained (light-sleep on)
+→ 1 TPS sustained → **~40 days** (POWER.md §4.5)
+→ Lighter workload: see POWER.md §4.4 for the full model
 
-**Wi-Fi UDP build — superseded by [POWER.md §12.6]:**
+|
 
 | Mode | Current | Time/Day | Energy/Day |
 |------|---------|----------|------------|
 | Active (consensus) | see POWER.md §12.6 | derived (workload-model) | see POWER.md §12.6 |
 | Light sleep | 0.13 mA (130 µA datasheet typ) | per POWER.md §4.2 | derived |
-| **Total** | — | — | **~17 mAh/day** (PS_MIN_MODEM + light-sleep; UDP is more efficient than ESP-NOW because modem-sleep is enabled) |
+| **Total** | ~7.96 mA avg | — | **~191 mAh/day** (from POWER.md §4.4) |
 
-→ 1000 mAh battery → **~58 days battery life**
+→ 1000 mAh battery → **~5 days battery life** at 14 TPS sustained (light-sleep on)
+→ 1 TPS sustained → **~40 days** (POWER.md §4.5)
+→ Lighter workload: see POWER.md §4.4 for the full model
 
-> **Note (post-Round-2 audit):** the older "1 h active / 0.5 mA light sleep / 80 mA ESP-NOW active / 160 mA UDP active" numbers in this §3.8 were placeholders without derivation. POWER.md §4 derives active time from throughput (14 TPS @ 1 ms airtime = ~50 s/day at 833 TPS-demand, not 1 h), and §12.6 re-budgets correctly. The corrected numbers above are from POWER.md §12.6 (PS_MIN_MODEM + light-sleep).
+|
 
 ---
 

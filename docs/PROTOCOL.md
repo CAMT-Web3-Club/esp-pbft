@@ -194,7 +194,7 @@ The `sender_id` is extracted from the packet header (§4), NOT from MAC/IP — t
 | Aspect | ESP-NOW | Wi-Fi UDP multicast |
 |--------|---------|----------------------|
 | **Max payload** | 250 B | ~1472 B (MTU) |
-| **Max nodes (theoretical)** | 20 (encrypt) / 6 (unencrypt) | unlimited |
+| **Max nodes (theoretical)** | 20 total / 6 encrypted | unlimited |
 | **AP needed** | ❌ no | ✅ yes |
 | **Latency** | 10-20 ms | 20-50 ms |
 | **Power** | 80 mA | 160 mA |
@@ -274,7 +274,7 @@ If a future wire field is added that uses a cryptographic format with mixed endi
 | Type ID | Name | Direction | Size (typical) | Defined in |
 |---------|------|-----------|----------------|------------|
 | 0 | `PBFT_MSG_HELLO` | bidirectional (bootstrap) | 4 + 1 + 65 + 32 = **102 B wire, 104 B with 2 B alignment pad** | §6.1 |
-| 1 | `PBFT_MSG_PRE_PREPARE` | primary → all | 4 + 4 + 8 + 32 + 2 + payload + 32 = **82 + payload B** | §6.2 |
+| 1 | `PBFT_MSG_PRE_PREPARE` | primary → all | 4 (header) + 4 (view) + 8 (seq) + 32 (digest) + 2 (payload_len) + payload + 32 (mac) = **82 + payload B wire** | §6.2 |
 | 2 | `PBFT_MSG_PREPARE` | all → all | 4 + 4 + 8 + 32 + 32 = **80 B** | §6.3 |
 | 3 | `PBFT_MSG_COMMIT` | all → all | 4 + 4 + 8 + 32 + 32 = **80 B** | §6.4 |
 | 4 | `PBFT_MSG_VIEW_CHANGE` | all → all | 4 + 88 + n_prepared × 40 = **88–4088 B** | §6.5 + [VIEW-CHANGE.md §4.3](./VIEW-CHANGE.md) |

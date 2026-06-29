@@ -73,7 +73,7 @@ typedef struct {
     uint8_t            digest[32];          // SHA-256 of request payload
     uint8_t            msg_type;            // request type tag
     uint16_t           payload_len;         // bytes used in payload[]
-    uint8_t            payload[256];        // inline request (PBFT_TX_PAYLOAD_MAX)
+    uint8_t            payload[PBFT_TX_PAYLOAD_MAX];   // inline request (CHANGED — audit A5)
     pbft_entry_state_t state;               // FREE/PRE_PREPARED/PREPARED/COMMITTED/EXECUTED
     uint8_t            prepare_bitmask;     // bit i = replica i sent Prepare
     uint8_t            commit_bitmask;      // bit i = replica i sent Commit
@@ -551,7 +551,7 @@ void pbft_gc_up_to(uint64_t stable_seq) {
 
 ```c
 bool pbft_log_full(void) {
-    return next_sequence > high_watermark + PBFT_LOG_MAX_ENTRIES;
+    return next_sequence > high_watermark;
 }
 ```
 
