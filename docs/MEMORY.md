@@ -23,13 +23,19 @@ Heap usage from PSA crypto, FreeRTOS, and ESP-IDF components (ESP-NOW, Wi-Fi) is
 esp-pbft groups the per-module items below into **4 regions by lifetime**,
 matching the structure in [ARCHITECTURE.md §11.2](./ARCHITECTURE.md#112-static-allocation-inventory--4-region-layout-tinybft-vi-a):
 
-| Region | Items (see §2.x below) | v1 (BSS) | v2 (NVM) | Budget (static_assert) |
-|--------|------------------------|---------|----------|-----------------------|
-| **1. Agreement** | §2.3 (PBFT log), §2.5 (V-set) | 36 + 1.7 KB | SPI Flash | ≤ 40 KB |
-| **2. Checkpoint** | §2.6 (proofs), §2.7 (watermarks) | 640 + 50 B | SPI Flash | ≤ 1 KB |
-| **3. Event** | §2.13 (TX queue inbox for New-View) | ~4.5 KB | RAM | ≤ 4 KB |
-| **4. Scratch** | §2.8 (network buffers, MAC input) | 8 KB + 304 B | RAM | ≤ 16 KB |
-| **Cross-region** | §2.1-2.4, §2.9-2.12, §2.14 | ~20 KB | RAM | n/a |
+| Region | Items | v1 (BSS) | v2 (NVM) | Budget |
+|--------|-------|---------|----------|--------|
+| **1. Agreement** | §2.3 (PBFT log 36 KB) + §2.5 (V-set 1.7 KB) | **~37.7 KB** | SPI Flash | ≤ 40 KB |
+| **2. Checkpoint** | §2.6 (proofs 640 B) + §2.15 (state digests 256 B) | **~896 B** | SPI Flash | ≤ 1 KB |
+| **3. Event** | §2.16 (New-View inbox 1.3 KB) + §2.17 (catch-up req 560 B + catch-up resp 1.4 KB) | **~3.25 KB** | RAM | ≤ 4 KB |
+| **4. Scratch** | §2.8 (net buffers 8 KB + MAC 304 B) + §2.13 (TX queue 4.5 KB) | **~12.8 KB** | RAM | ≤ 16 KB |
+| **Cross-region** | §2.1-2.4, §2.7, §2.9-2.12, §2.14 | **~14 KB** | RAM | n/a |
+| **Grand total (BSS)** | All of the above | **~68 KB** | — | ≤ 80 KB |
+
+> See ARCHITECTURE §11.2 / §11.10 for the canonical numbers. The 6 region tags
+> (§2.3, §2.5 Agreement; §2.6, §2.15 Checkpoint; §2.7 Checkpoint watermarks;
+> §2.8, §2.13 Scratch; §2.16, §2.17 Event) are the per-module marker tags. The
+> §2.0 table is the **summary** — both must agree.
 
 > **Why this matters for v2:** When the cluster grows beyond n=7 (the v1 design point),
 > the **Agreement** and **Checkpoint** regions can be offloaded to SPI Flash
@@ -188,7 +194,10 @@ typedef struct {
 
 Eight slots support one in-flight checkpoint proof per node plus headroom.
 
-### 2.7 Watermark state — **Checkpoint region**
+### 2.7 Watermark state — **Checkpoint region** (watermarks only)
+
+Tracks the GC range `[low_watermark, high_watermark]` only. Does **not** store
+state digests — those are in §2.15 (`s_state_digests[]`).
 
 ```c
 static pbft_watermark_state_t s_watermarks;   // ~50 B
@@ -246,7 +255,7 @@ Already covered in §2.9 as `s_peer_pub_arena`.
 static pbft_metrics_t s_metrics;   // ~120 B
 ```
 
-### 2.13 Pending-TX queue (for `pbft_submit_from_isr`) — **Event region**
+### 2.13 Pending-TX queue (for `pbft_submit_from_isr`) — **Scratch region**
 
 ```c
 static pbft_tx_queue_entry_t s_tx_queue[16];   // 16 × ~280 B = ~4.5 KB
@@ -263,6 +272,51 @@ Each entry holds a TX (inline payload) + the originating task handle for ack.
 | Alarm/event flags | ~20 B |
 | Padding | ~50 B |
 | **Total** | **~140 B** |
+
+### 2.15 State digests (next-checkpoint cache) — **Checkpoint region**
+
+A small FIFO cache of recent stable state digests, kept alongside the proof
+table (§2.6) so a state-transfer request (§2.17) can be answered without
+re-computing the SHA-256 of the app state.
+
+```c
+#define PBFT_STATE_DIGESTS_MAX 4
+static pbft_state_digest_t s_state_digests[PBFT_STATE_DIGESTS_MAX];
+// 4 × 64 B = ~256 B (40 B sequence+label + 32 B digest)
+```
+
+Distinct from `pbft_watermark_state_t` (§2.7, **watermarks only**) — this stores
+the digests, watermarks track the range; ARCHITECTURE §11.2 calls this out
+explicitly as the second half of the Checkpoint region.
+
+### 2.16 New-View inbox — **Event region**
+
+A single-slot buffer holding the most recent pending New-View for the current
+view-change round. Replaced on every New-View received. Sized for the worst-case
+New-View payload (see [PROTOCOL.md §6.6](./PROTOCOL.md#66-pbft_msg_new_view)).
+
+```c
+static pbft_new_view_t   s_new_view_inbox;   // ~1.3 KB worst-case
+```
+
+### 2.17 Catch-up inbox — **Event region**
+
+When a replica falls behind (no peer within `PBFT_CHECKPOINT_INTERVAL` of its
+`last_executed_seq`), it broadcasts `STATE_REQUEST`. Peers respond with
+`STATE_RESPONSE` containing the missing log range + state proof.
+
+```c
+static struct {
+    pbft_state_request_t   requests[7];     // 1 per peer
+    pbft_state_response_t  responses[7];    // 1 per peer
+    uint8_t                req_count;
+    uint8_t                resp_count;
+} s_catchup;   // 7 × 80 B (req) + 7 × 200 B (resp) + 2 B count = ~1.96 KB
+```
+
+Sized for the worst-case response payload. Outlives one view-change (region
+lifetime = one-shot per out-of-sync event), matching TinyBFT §VI-A's "Event
+Region" definition.
 
 ---
 
