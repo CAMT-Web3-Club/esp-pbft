@@ -132,15 +132,20 @@ typedef struct {
 ### 2.5 V-set arena (VIEW-CHANGE.md §4.1)
 
 ```c
-static pbft_view_change_t s_vc_set_arena[7];   // 7 × 488 B = ~3.4 KB
+static pbft_view_change_t s_vc_set_arena[7];   // 7 × 248 B = ~1.7 KB
                                                   // (each slot sized for max prepared count)
 ```
 
-Each `pbft_view_change_t` slot holds up to `PBFT_VC_MAX_PREPARED = 10` prepared entries:
+Each `pbft_view_change_t` slot holds up to `PBFT_VC_MAX_PREPARED = 4` prepared entries:
 
+```c
+slot size = 88 + 4 × 40 = 248 B  // ≤ ESP-NOW 250 B
 ```
-slot size = 88 + 10 × 40 = 488 B
-```
+
+> **Note (no-runtime-fallback):** `PBFT_VC_MAX_PREPARED = 4` (not 10) is enforced at compile time so that
+> View-Change fits in ESP-NOW 250 B. If you need to carry more prepared entries, you must select
+> `CONFIG_PBFT_TRANSPORT_WIFI_UDP=y` AND use New-View over UDP. View-Change still fits ESP-NOW
+> in the default config.
 
 ### 2.6 Checkpoint proof table (CHECKPOINT.md §5.3)
 
@@ -252,7 +257,7 @@ Each entry holds a TX (inline payload) + the originating task handle for ack.
 | Cluster members | ~112 B |
 | PBFT log (100 × 360 B) | ~36 KB |
 | View state | ~120 B |
-| V-set arena (7 × 488 B) | ~3.4 KB |
+| V-set arena (7 × 248 B) | ~1.7 KB |
 | Checkpoint proofs | ~640 B |
 | Watermark state | ~50 B |
 | Network buffers | ~16 KB |
@@ -527,7 +532,7 @@ _Static_assert(PBFT_TX_PAYLOAD_MAX + 82 <= 250,
                "Pre-Prepare with max payload exceeds ESP-NOW 250 B limit — "
                "either reduce PBFT_TX_PAYLOAD_MAX or select "
                "CONFIG_PBFT_TRANSPORT_WIFI_UDP=y (compile-time only, no runtime fallback)");
-_Static_assert(sizeof(pbft_view_change_t) + PBFT_VC_MAX_PREPARED * 40 <= 250,
+_Static_assert(sizeof(pbft_view_change_t) <= 250,
                "View-Change worst case exceeds ESP-NOW 250 B — "
                "either reduce PBFT_VC_MAX_PREPARED or select "
                "CONFIG_PBFT_TRANSPORT_WIFI_UDP=y (compile-time only, no runtime fallback)");

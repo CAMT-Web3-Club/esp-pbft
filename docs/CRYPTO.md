@@ -111,12 +111,13 @@ The key state in BSS:
 // Static state — all in BSS
 static psa_key_id_t s_my_priv_key_id;                  // own ECDSA private key (DERIVE only)
 static uint8_t      s_my_pub[65];                      // own public key (uncompressed P-256: 0x04 ‖ X ‖ Y)
-static psa_key_id_t s_peer_pub_key_ids[7];             // imported peer public keys (handles)
-static uint8_t      s_peer_pub_arena[7][65];            // raw peer public key bytes (uncompressed)
+static uint8_t      s_peer_pub_arena[7][65];            // raw peer public key bytes (uncompressed, for ECDH)
 static psa_key_id_t s_hmac_key_ids[7];                 // derived HMAC keys (handles)
 static uint8_t      s_hmac_key_arena[7][32];            // raw HMAC key bytes (for clearing)
-static bool         s_have_peer_pub[7];                 // true once we've imported a peer pubkey
+static bool         s_have_peer_pub[7];                 // true once we've received a peer pubkey
 ```
+
+> **Note (PSA API correction):** The earlier "Audit A4" fix in §4.1 incorrectly wrapped the peer pubkey as a PSA key (via `psa_import_key` + `s_peer_pub_key_ids`). The actual TF-PSA-Crypto v1.0 signature of `psa_key_agreement` accepts the peer's **raw uncompressed pubkey bytes** (`const uint8_t *peer_key, size_t peer_key_length`) directly — no need to import as a PSA key first. The fix below uses the correct API and drops `s_peer_pub_key_ids[7]`.
 
 Boot sequence:
 
@@ -152,53 +153,30 @@ void pbft_crypto_boot(void) {
     // 5. Wait for Hellos from 6 peers (timeout 5s)
     if (pbft_discovery_wait(5000) != ESP_OK) { /* retry or fail */ }
 
-    // 6. For each peer: import pubkey, then ECDH, then derive HMAC key
+    // 6. For each peer: ECDH (using raw pubkey bytes), then derive HMAC key
     for (int peer = 0; peer < PBFT_CLUSTER_SIZE; peer++) {
         if (peer == my_node_id) continue;
 
-        // (a) Import peer's pubkey as a PSA key
-        //     This is required — psa_key_agreement() does NOT accept raw bytes;
-        //     it requires a psa_key_id_t for the public side.
-        psa_key_attributes_t pub_attr = PSA_KEY_ATTRIBUTES_INIT;
-        psa_set_key_type(&pub_attr, PSA_KEY_TYPE_ECC_PUBLIC_KEY(PSA_ECC_FAMILY_SECP_R1));
-        psa_set_key_bits(&pub_attr, 256);
-        psa_set_key_algorithm(&pub_attr, PSA_ALG_ECDH);
-        psa_set_key_usage_flags(&pub_attr, PSA_KEY_USAGE_DERIVE);
-
-        // Destroy any prior import for this peer (e.g., from previous boot)
-        if (s_have_peer_pub[peer]) {
-            psa_destroy_key(s_peer_pub_key_ids[peer]);
-            s_have_peer_pub[peer] = false;
-        }
-
-        // Wire-format precondition: peer pubkey must be 65 bytes uncompressed
-        // (0x04 ‖ X_BE ‖ Y_BE). PSA rejects anything else with PSA_ERROR_INVALID_ARGUMENT.
-        // If a peer sends 64-byte raw X‖Y or 33-byte compressed (0x02/0x03 ‖ X), we
-        // must rehydrate to 65 bytes before calling psa_import_key() — see esp-idf
-        // components/wpa_supplicant/esp_supplicant/src/crypto/crypto_mbedtls-ec.c:2984-3080
-        // (crypto_ecdh_set_peerkey) for the canonical rehydration pattern.
-        if (s_peer_pub_arena[peer][0] != 0x04) {
+        // (a) Wire-format precondition: peer pubkey must be 65 bytes uncompressed
+        //     (0x04 ‖ X_BE ‖ Y_BE). PSA rejects anything else with PSA_ERROR_INVALID_ARGUMENT.
+        //     If a peer sends 64-byte raw X‖Y or 33-byte compressed (0x02/0x03 ‖ X), we
+        //     must rehydrate to 65 bytes before calling psa_key_agreement() — see esp-idf
+        //     components/wpa_supplicant/esp_supplicant/src/crypto/crypto_mbedtls-ec.c:2984-3080
+        //     (crypto_ecdh_set_peerkey) for the canonical rehydration pattern.
+        if (!s_have_peer_pub[peer] || s_peer_pub_arena[peer][0] != 0x04) {
             ESP_LOGE(TAG, "peer %d pubkey missing 0x04 prefix (got 0x%02x)",
-                     peer, s_peer_pub_arena[peer][0]);
+                     peer, s_have_peer_pub[peer] ? s_peer_pub_arena[peer][0] : 0);
             continue;
         }
-        size_t peer_pub_len;
-        psa_status_t s = psa_import_key(&pub_attr,
-                                         s_peer_pub_arena[peer], 65,
-                                         &s_peer_pub_key_ids[peer]);
-        if (s != PSA_SUCCESS) {
-            // Invalid curve point or other error — log alarm + skip peer
-            ESP_LOGE(TAG, "psa_import_key failed for peer %d: %d", peer, (int)s);
-            continue;
-        }
-        s_have_peer_pub[peer] = true;
 
-        // (b) ECDH: shared = ECDH(my_priv, peer_pub_key_id)
+        // (b) ECDH: shared = ECDH(my_priv, peer_pub_bytes)
+        //     Per TF-PSA-Crypto v1.0: psa_key_agreement accepts the peer's raw
+        //     uncompressed pubkey bytes directly — no need to import as a PSA key.
         uint8_t shared[32];
         size_t shared_len = 0;
-        s = psa_key_agreement(PSA_ALG_ECDH,
-                              s_my_priv_key_id,
-                              s_peer_pub_key_ids[peer],
+        s = psa_key_agreement(s_my_priv_key_id,
+                              s_peer_pub_arena[peer], 65,
+                              PSA_ALG_ECDH,
                               shared, sizeof(shared), &shared_len);
         if (s != PSA_SUCCESS || shared_len != 32) {
             ESP_LOGE(TAG, "psa_key_agreement failed for peer %d: %d", peer, (int)s);
@@ -239,9 +217,9 @@ void pbft_crypto_boot(void) {
 }
 ```
 
-**Key insight (fixes audit A4):** PSA's `psa_key_agreement()` requires both private and public keys as `psa_key_id_t` handles. Raw bytes on the public side are not accepted. The corrected flow imports the peer's pubkey as a transient PSA key first, then runs the agreement. Similarly, the derived HMAC key is imported as a PSA HMAC key so that `psa_mac_compute()` / `psa_mac_verify()` can use it directly.
+**Key insight (PSA Crypto on TF-PSA-Crypto v1.0):** The actual `psa_key_agreement()` signature in ESP-IDF v6.0.1 accepts the peer's **raw uncompressed pubkey bytes** (`const uint8_t *peer_key, size_t peer_key_length`) directly — no need to import the peer's pubkey as a PSA key first. This means the BSS layout in §4.1 only needs the raw `s_peer_pub_arena[7][65]` and does not require `s_peer_pub_key_ids[7]`. The derived HMAC key is still imported as a PSA HMAC key so that `psa_mac_compute()` / `psa_mac_verify()` can use it directly.
 
-For Y-5 re-gen (§7), the same flow runs: each peer's imported key ID is destroyed before the new pubkey is imported.
+For Y-5 re-gen (§7), the same flow runs: each peer's cached pubkey in `s_peer_pub_arena[peer]` is overwritten with the new pubkey, and the HMAC key is re-derived.
 
 ### 4.2 Why simple SHA-256 (not HKDF)?
 
@@ -442,12 +420,13 @@ esp_err_t pbft_on_hello(const pbft_hello_t* hello) {
     if (peer >= PBFT_CLUSTER_SIZE) return ESP_ERR_INVALID_ARG;
 
     // TOFU check: have we seen this peer before?
-    bool first_hello = !peer_pubkey_cached[peer];
+    bool first_hello = !s_have_peer_pub[peer];
 
     if (first_hello) {
         // VERY FIRST Hello of a never-seen peer (TOFU): a zero MAC is accepted ONLY here.
         // Cache the pubkey (first wins)
-        memcpy(peer_pubkey_cached[peer], hello->pubkey, 65);
+        memcpy(s_peer_pub_arena[peer], hello->pubkey, 65);
+        s_have_peer_pub[peer] = true;
         // Compute HMAC key with new peer
         pbft_derive_hmac_key(peer, hello->pubkey);
         ESP_LOGW(TAG, "First hello from node %d — TOFU trust (zero MAC permitted)", peer);
@@ -464,7 +443,7 @@ esp_err_t pbft_on_hello(const pbft_hello_t* hello) {
             // MAC verified under the current key → accept the rolled pubkey (§7.3).
         } else {
             // Plain (non-re_handshake) Hello from a known peer: pubkey MUST match cache.
-            if (memcmp(peer_pubkey_cached[peer], hello->pubkey, 65) != 0) {
+            if (memcmp(s_peer_pub_arena[peer], hello->pubkey, 65) != 0) {
                 ESP_LOGE(TAG, "Hello from node %d has different pubkey! Alarm!", peer);
                 return ESP_ERR_INVALID_PEER;
             }
@@ -544,7 +523,7 @@ void pbft_y5_timer_cb(void) {
 
     // 1. KEEP the old keys. Snapshot the current HMAC keys into the "old" arena so the RX
     //    path can still verify under them during the grace window. Do NOT destroy yet,
-    //    and do NOT clear peer_pubkey_cached (peers are unchanged; only OUR keypair rolls).
+    //    and do NOT clear s_peer_pub_arena (peers are unchanged; only OUR keypair rolls).
     memcpy(s_hmac_key_ids_old, s_hmac_key_ids, sizeof(s_hmac_key_ids));
     s_old_keys_valid = true;
     psa_key_id_t old_priv = my_priv_key_id;   // retain handle for grace window
@@ -607,9 +586,9 @@ When a replica receives Hello with `re_handshake=1` from peer X:
 // Already in pbft_on_hello()
 if (hello->re_handshake && !first_hello) {
     // Same pubkey? Could be wrong peer, reject
-    if (memcmp(peer_pubkey_cached[peer], hello->pubkey, 65) != 0) {
+    if (memcmp(s_peer_pub_arena[peer], hello->pubkey, 65) != 0) {
         // Different pubkey for known peer → re-handshake accepted
-        memcpy(peer_pubkey_cached[peer], hello->pubkey, 65);
+        memcpy(s_peer_pub_arena[peer], hello->pubkey, 65);
         pbft_derive_hmac_key(peer, hello->pubkey);
         ESP_LOGW(TAG, "Soft re-handshake with node %d", peer);
     }

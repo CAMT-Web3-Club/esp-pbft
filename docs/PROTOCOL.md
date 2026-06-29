@@ -411,7 +411,7 @@ Sent when replica suspects primary is faulty.
 | `new_view` | 4 B | next view to transition to |
 | `checkpoint_seq` | 8 B | last stable checkpoint sequence number |
 | `checkpoint_digest` | 32 B | digest of app state at checkpoint |
-| `n_prepared` | 1 B | number of prepared entries (0..PBFT_VC_MAX_PREPARED, default 10) |
+| `n_prepared` | 1 B | number of prepared entries (0..PBFT_VC_MAX_PREPARED, default 4) |
 | prepared entries | 0–4000 B | each is `{seq:u64, digest:32}` = 40 B |
 | `mac` | 32 B | HMAC over header + body (no MAC trailer on entries) |
 
@@ -420,12 +420,16 @@ Sent when replica suspects primary is faulty.
 ```kconfig
 config PBFT_VC_MAX_PREPARED
     int "Max prepared entries carried in a View-Change"
-    default 10
-    range 0 100
+    default 4
+    range 0 4
     help
-      Caps the worst-case View-Change size. With n_prepared=10 the
-      worst-case VC = 488 B (still fits ESP-NOW); with 100 it's 4088 B
-      (forces UDP). Set per cluster reliability requirements.
+      Caps the worst-case View-Change size. With n_prepared=4 the
+      worst-case VC = 248 B (fits ESP-NOW 250 B with 2 B spare);
+      with 10 it would be 488 B (no longer fits). The default 4
+      enforces the "no-runtime-fallback" rule: View-Change MUST
+      always be ≤ 250 B at compile time. To allow more prepared
+      entries you must also change the transport — see
+      CONFIG_PBFT_TRANSPORT_ESP_NOW vs WIFI_UDP.
 ```
 
 ### 6.6 New-View (`PBFT_MSG_NEW_VIEW`, type 5)
@@ -441,9 +445,9 @@ New primary broadcasts its proof + new Pre-Prepare messages.
    { O-set Pre-Prepares: each carries its own Pre-Prepare MAC } |
    mac (32)              ← over header + view + num_vc + v_set_digest + VC proofs
 
-   Worst case (n=7, n_prepared=10 each VC): ≈ 2516 B
+   Worst case (n=7, n_prepared=4 each VC): ≈ 1316 B
    + O-set (10 Pre-Prepares × 338 B): ≈ 3380 B
-   Grand total worst case ≈ 5900 B → UDP only
+   Grand total worst case ≈ 4.7 KB → UDP only
 ```
 
 | Field | Size | Notes |

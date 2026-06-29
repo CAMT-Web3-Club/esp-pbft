@@ -100,8 +100,8 @@ typedef struct {
     uint64_t            next_sequence;          // primary's next-to-assign counter
     uint64_t            last_committed_seq;
     uint64_t            last_executed_seq;
-    uint64_t            low_watermark;          // GC lower bound
-    uint64_t            high_watermark;         // GC upper bound (high = low + LOG_MAX)
+    // NOTE: low_watermark and high_watermark live in pbft_watermark_state_t
+    // (single-owner rule per MEMORY §2.4). Access them via pbft_watermark_get().
 
     // V-set cache: VIEW-CHANGE messages received for the current view_change target
     uint8_t             vc_set_count;           // 0..n-1
@@ -187,10 +187,10 @@ The MAC input is `view ‖ new_view ‖ checkpoint_seq ‖ checkpoint_digest ‖
   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-++
 ```
 
-**Size estimate (worst case n=7, n_prepared=10 each VC):**
-- VC proof size = 88 + 10 × 40 = 488 B
-- 5 VC proofs (≥ 2f+1) = 2440 B
-- New-View outer = 4 + 4 + 1 + 3 + 32 + 2440 + 32 = 2516 B
+**Size estimate (worst case n=7, n_prepared=4 each VC):**
+- VC proof size = 88 + 4 × 40 = 248 B
+- 5 VC proofs (≥ 2f+1) = 1240 B
+- New-View outer = 4 + 4 + 1 + 3 + 32 + 1240 + 32 = 1316 B
 - + O-set: typically 0-10 Pre-Prepares × 338 B = 0-3380 B
 - **Grand total worst case ≈ 5.9 KB** → **UDP only.**
 
@@ -267,7 +267,7 @@ void pbft_send_view_change(uint32_t new_view) {
     for (int i = 0; i < PBFT_LOG_MAX_ENTRIES; i++) {
         pbft_log_entry_t* e = &pbft_log[i];
         if (e->state == PBFT_STATE_FREE) continue;
-        if (e->sequence <= view_state.low_watermark) continue;
+        if (e->sequence <= pbft_watermark_get_low()) continue;
         if (e->state != PBFT_STATE_PREPARED &&
             e->state != PBFT_STATE_COMMITTED &&
             e->state != PBFT_STATE_EXECUTED) continue;
@@ -280,11 +280,11 @@ void pbft_send_view_change(uint32_t new_view) {
     pbft_view_change_t vc = {
         .view            = view_state.view,
         .new_view        = new_view,
-        .checkpoint_seq  = view_state.low_watermark,
+        .checkpoint_seq  = pbft_watermark_get_low(),
         .n_prepared      = n,
     };
     // Fill checkpoint_digest: SHA-256 of app state at low_watermark (TBD; app-supplied)
-    pbft_checkpoint_digest_at(view_state.low_watermark, vc.checkpoint_digest);
+    pbft_checkpoint_digest_at(pbft_watermark_get_low(), vc.checkpoint_digest);
     // Fill prepared entries (variable length — pack into a buffer)
     memcpy(((uint8_t*)&vc) + offsetof(pbft_view_change_t, prepared),
            prepared, n * sizeof(pbft_prepared_entry_t));
@@ -660,10 +660,10 @@ New primary crashes mid-view-change. The `viewchange_timeout_ms` fires on all re
 | Item | Static size | Notes |
 |------|-------------|-------|
 | `pbft_view_state_t` | ~120 B | single instance |
-| `vc_set_arena[7]` (each VC slot) | 7 × max_vc_size | max ≈ 4088 B per VC → 28 KB if worst case; in practice VCs have ≤ 10 prepared → 7 × 488 = 3.4 KB |
-| Practical static cost | ~3.5 KB | aligns with HANDOVER §3.7 "View-change state ~1 KB" + a few KB slack |
-| View-Change wire (typical) | 88 + n_prepared × 40 B | n_prepared ≈ 0-10 → 88-488 B |
-| View-Change wire (worst) | 4088 B | n_prepared = 100 |
+| `vc_set_arena[7]` (each VC slot) | 7 × max_vc_size | max ≈ 4088 B per VC → 28 KB if worst case; in practice VCs have ≤ 4 prepared → 7 × 248 = 1.7 KB |
+| Practical static cost | ~1.8 KB | aligns with HANDOVER §3.7 "View-change state ~1 KB" + a few hundred B slack |
+| View-Change wire (typical) | 88 + n_prepared × 40 B | n_prepared ≈ 0-4 → 88-248 B (fits ESP-NOW 250 B) |
+| View-Change wire (worst) | 248 B | n_prepared = 4 (= PBFT_VC_MAX_PREPARED); fits ESP-NOW |
 | New-View wire (typical) | 2500-5000 B | UDP only |
 | New-View wire (worst) | ~5.9 KB | UDP only |
 
@@ -680,10 +680,10 @@ CONFIG_PBFT_PREPARE_TIMEOUT_MS=1000
 CONFIG_PBFT_COMMIT_TIMEOUT_MS=1000
 CONFIG_PBFT_MAX_VIEW_GAP=100        # before declaring "partition mode"
 CONFIG_PBFT_VIEWCHANGE_RETRANSMIT=3 # VC/NEW-VIEW retransmit count
-CONFIG_PBFT_VC_MAX_PREPARED=10      # cap on n_prepared in VC (truncates worst case)
+CONFIG_PBFT_VC_MAX_PREPARED=4       # cap on n_prepared in VC (enforces ≤ 250 B ESP-NOW; see "no-runtime-fallback")
 ```
 
-`PBFT_VC_MAX_PREPARED` is the most important: it bounds the View-Change wire size to `88 + 10 × 40 = 488 B` — fits ESP-NOW. Any prepared entries beyond the cap are aggregated (we send only the highest-sequence `PBFT_VC_MAX_PREPARED` entries; lower ones will be re-proposed by the new primary from the local log anyway, because every replica keeps the log across view-change).
+`PBFT_VC_MAX_PREPARED` is the most important: it bounds the View-Change wire size to `88 + 4 × 40 = 248 B` — fits ESP-NOW 250 B with 2 B spare. Any prepared entries beyond the cap are aggregated (we send only the highest-sequence `PBFT_VC_MAX_PREPARED` entries; lower ones will be re-proposed by the new primary from the local log anyway, because every replica keeps the log across view-change). If you need more than 4 prepared entries carried, you MUST select `CONFIG_PBFT_TRANSPORT_WIFI_UDP=y` and route View-Change through UDP — see PROTOCOL.md §2.5 / §8 for the no-runtime-fallback rule.
 
 ---
 
