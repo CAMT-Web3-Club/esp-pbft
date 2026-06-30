@@ -1,6 +1,6 @@
 # esp-pbft — C Coding Standard & Static Analysis Recommendations
 
-**Target:** esp-pbft v0.0.x on ESP-IDF v6.0.1, ESP32-C3 (RV32IMC), GCC 15.2.0 (`gnu23`)
+**Target:** esp-pbft v0.0.x on ESP-IDF v6.0.1 (Mbed TLS 4.0.0) and v6.0.2 (Mbed TLS 4.1.0) — both verified; component manifest declares `idf: ">=6.0.2"`. Hardware: ESP32-C3 (RV32IMC). Toolchain: GCC 15.2.0 (`gnu23`).
 **Audience:** esp-pbft maintainers and contributors
 **Status:** Recommendation (not a binding spec — adapt to project evolution)
 
@@ -13,7 +13,7 @@
 ## 0. Verified baseline (read once, then enforced forever)
 
 These facts were confirmed directly against the local install at
-`/home/cargo/.espressif/v6.0.1/` and the toolchain binaries on this machine:
+`$IDF_PATH/` and the toolchain binaries on this machine:
 
 | Item | Value | Source |
 |---|---|---|
@@ -117,7 +117,7 @@ default rules are tuned for the entire framework, not for safety-relevant crypto
 - **Pros for esp-pbft:** Industry standard for safety; MISRA rules catch real
   bugs (Zephyr's own coding rules — see §1.5 — explicitly cite MISRA C:2012 as
   the underlying rule set); C11/C18 coverage in MISRA C:2023 is sufficient for
-  most of what ESP-IDF v6.0.1 Mbed TLS 4.0.0 / TF-PSA-Crypto need.
+  most of what ESP-IDF v6.0.1 Mbed TLS 4.0.0 / TF-PSA-Crypto need (v6.0.2: Mbed TLS 4.1.0).
 - **Cons for esp-pbft:** **MISRA C document is paid** (PDF costs non-trivial
   money). MISRA is permissive enough that you can claim "compliance with
   deviations" for many rules, but documenting the deviations is work. Many
@@ -570,7 +570,7 @@ All are O(1), inlinable, and produce deterministic wire output regardless of hos
 
 ## 4. Recommended compiler flags for esp-pbft
 
-### 4.1 Confirmed baseline (already inherited from ESP-IDF v6.0.1)
+### 4.1 Confirmed baseline (already inherited from ESP-IDF v6.0.1 and v6.0.2)
 
 These are present by default (verified in `compile_commands.json` for the
 `example/counter` build):
@@ -912,15 +912,15 @@ overhead of ~30% build time on the esp-pbft component.
 
 1. **ESP-IDF v6.0.1 style guide** —
    `https://github.com/espressif/esp-idf/blob/v6.0.1/docs/en/contribute/style-guide.rst`
-   (local copy at `/home/cargo/.espressif/v6.0.1/esp-idf/docs/en/contribute/style-guide.rst`).
+   (local copy at `$IDF_PATH/docs/en/contribute/style-guide.rst`).
 2. **ESP-IDF v6.0.1 build flags** —
-   `/home/cargo/.espressif/v6.0.1/esp-idf/tools/cmake/build.cmake` (lines 160-220)
-   and top-level `/home/cargo/.espressif/v6.0.1/esp-idf/CMakeLists.txt`
+   `$IDF_PATH/tools/cmake/build.cmake` (lines 160-220)
+   and top-level `$IDF_PATH/CMakeLists.txt`
    (lines 20-300).
 3. **ESP-IDF astyle rules** —
-   `/home/cargo/.espressif/v6.0.1/esp-idf/tools/ci/astyle-rules.yml`.
+   `$IDF_PATH/tools/ci/astyle-rules.yml`.
 4. **ESP-IDF pre-commit hooks** —
-   `/home/cargo/.espressif/v6.0.1/esp-idf/.pre-commit-config.yaml`.
+   `$IDF_PATH/.pre-commit-config.yaml`.
 5. **GCC 15.2.0 on this toolchain** —
    `riscv32-esp-elf-gcc --version` output: *"crosstool-NG esp-15.2.0_20251204) 15.2.0"*.
 6. **GCC `-fanalyzer` documentation** —

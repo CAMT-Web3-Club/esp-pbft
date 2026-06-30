@@ -1,12 +1,18 @@
-version: "0.0.1"
-description: PBFT — memory-optimised PBFT consensus for ESP-IDF
-url: https://github.com/phukrit7171/esp-pbft
+version: "0.1.0"
+description: PBFT — memory-optimised PBFT consensus for ESP-IDF (design only; implementation pending)
+url: https://github.com/CAMT-Web3-Club/esp-pbft
 license: "MIT"
+# Primary target: esp32c3 (RISC-V, 400 KB SRAM, hardware TRNG/SHA/ECC).
+# Other targets listed below are NOT yet validated — the design relies on
+# single-core RV32 semantics, hardware SHA-256, and the hardware ECC
+# peripheral that all listed chips provide, but multi-core chips (esp32/
+# esp32s2/esp32s3) need an explicit re-validation of the FreeRTOS single-task
+# concurrency model and the static-memory budget. See docs/ROADMAP.md §10 (R4).
 targets:
+  - esp32c3
   - esp32
   - esp32s2
   - esp32s3
-  - esp32c3
   - esp32c6
   - esp32c61
   - esp32h2
