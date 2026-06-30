@@ -1,7 +1,5 @@
 # ทำความเข้าใจ PBFT (Practical Byzantine Fault Tolerance) อย่างละเอียด
 
-> **Language note (2026-06-29):** This is the only doc in the suite written in **Thai** (ภาษาไทย). All other 16 docs in this project are in English. The Thai version is a *parallel explainer* of the PBFT protocol in general — it is not a translation of any other doc, and the esp-pbft-specific design lives in the English docs (CRYPTO.md, PROTOCOL.md, CONSENSUS.md, etc.). Conventions used in the English docs (n=7, f=2, quorum=5, `n % 7` primary selection, HMAC-SHA256, Y-5 re-gen) are not asserted in this Thai overview; it explains the *generic* PBFT algorithm using small examples (e.g. n=4 to keep the arithmetic simple).
-
 > **Scope:** general PBFT explainer. **No esp-pbft-specific decisions** (transport, crypto pattern, memory budget, etc.) are documented here — see the English docs for those.
 
 เอกสารฉบับนี้อธิบายหลักการทำงาน โครงสร้าง และคีย์เวิร์ดสำคัญของโปรโตคอล **Practical Byzantine Fault Tolerance (PBFT)** ตามงานวิจัยระดับตำนานของ Miguel Castro และ Barbara Liskov (OSDI 1999) โดยมุ่งเน้นการแปลเป็นภาษาไทยที่เข้าใจง่าย อธิบายความเชื่อมโยงของแต่ละภาคส่วน และเน้นย้ำถึงกลไกการรับมือกับความล้มเหลวแบบไบแซนไทน์อย่างเป็นขั้นเป็นตอนและละเอียดครบถ้วนสมบูรณ์ (Lossless)
